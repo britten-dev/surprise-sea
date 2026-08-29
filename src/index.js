@@ -16,7 +16,12 @@ export { WaveField } from './wavefield.js';
 export { Hull, HULL_DEFAULTS } from './hull.js';
 export { AirOverSea, AIR_DEFAULTS } from './airoversea.js';
 
-// The rendering half. Needs a WebGL context, so nothing under test/ touches it.
+// The rendering half. Only the foam field needs a live renderer, and only in
+// its update: everything here can be built, and its GLSL read, without a
+// context, which is how the shaders are tested.
 export { createOcean, skyGradientChunk, agxToneMapChunk } from './render/ocean.js';
+export { createFoamField, wakeStamper } from './render/foamfield.js';
+export { createSky } from './render/sky.js';
+export { createRain } from './render/rain.js';
 export { createSpray } from './render/spray.js';
 export { warpedGrid } from './render/grid.js';

@@ -17,9 +17,12 @@
 // decided not to animate.
 
 import * as THREE from 'three';
-// The sky must tone-map exactly as the water does, or the horizon carries a
-// faint step where the two gradings meet.
-import { agxToneMapChunk } from '../src/render/ocean.js';
+// Straight from their own files rather than through the barrel, so that a
+// half-built `src/index.js` — the two halves of this library are written by two
+// hands and one of them always lands first — cannot take the sky and the rain
+// down with it.
+import { createSky } from '../src/render/sky.js';
+import { createRain } from '../src/render/rain.js';
 
 // --- Settings ----------------------------------------------------------------
 
@@ -42,7 +45,8 @@ const SHIP = {
 
 // Three ways to light the same sea, lifted from the reference game's Southern
 // Ocean moods. `sunIntensity` and `ambient` are for the scene lights the block
-// hull needs; createOcean reads only the keys it knows.
+// hull needs; createOcean reads only the keys it knows. All three are dry —
+// rain is weather rather than light, and it is the panel's to add.
 const LIGHTS = [
   {
     label: 'Storm grey',
@@ -55,6 +59,7 @@ const LIGHTS = [
     fogDensity: 1.1,
     glare: 0.3,
     exposure: 1.0,
+    rain: 0,
     water: { deep: 0x25383c, crest: 0x3d6a5c, foam: 0xdfe4e4 },
   },
   {
@@ -68,6 +73,7 @@ const LIGHTS = [
     fogDensity: 0.85,
     glare: 0.95,
     exposure: 1.15,
+    rain: 0,
     water: { deep: 0x2a3f41, crest: 0x518063, foam: 0xe8e9e2 },
   },
   {
@@ -81,9 +87,24 @@ const LIGHTS = [
     fogDensity: 1.3,
     glare: 0.55,
     exposure: 0.85,
+    rain: 0,
     water: { deep: 0x1a252c, crest: 0x334e4b, foam: 0xb9bfc2 },
   },
 ];
+
+// The base fog density handed to createOcean. Kept here rather than inline
+// because the panel's visibility slider is the same number seen from the other
+// end, and the two conversions must agree about what one unit means.
+const BASE_FOG = 1.05e-4;
+
+// How much of the sky cube the water is allowed to believe. One would be a
+// mirror; a storm sea is not one, and the shipped procedural ramp is already
+// well art-directed, so the cube is a strong flavouring rather than a
+// replacement.
+const SKY_REFLECT = 0.85;
+
+// Where the custom weather lives between visits.
+const STORE_KEY = 'surprise-sea.weather.v1';
 
 // Helm first: it is the point of the exercise, so it is what the page opens on.
 const VIEWS = ['helm', 'chase', 'orbit'];
@@ -137,7 +158,10 @@ async function boot() {
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.4, 26000);
 
-  const sky = createSky();
+  // The dome, and the small cube of it the water reflects. Both come out of the
+  // library now, so the sea and the sky are drawn with one formula and cannot
+  // disagree about what is overhead.
+  const sky = createSky({ lighting: LIGHTS[0] });
   scene.add(sky.mesh);
 
   // The block hull is the only lit object in the scene; the sea and the sky
@@ -159,7 +183,7 @@ async function boot() {
 
   const ocean = createOcean(field, {
     quality: QUALITY,
-    fogDensity: 1.05e-4,
+    fogDensity: BASE_FOG,
     lighting: LIGHTS[0],
   });
   scene.add(ocean.mesh);
@@ -172,6 +196,15 @@ async function boot() {
     lighting: LIGHTS[0],
   });
   scene.add(spray.object3d);
+
+  // Weather. Nought by default, and nought costs nothing: no arithmetic, no
+  // instances, no draw call, until the panel's slider says otherwise.
+  const rain = createRain(field, {
+    windFromDeg: WIND_FROM_DEG,
+    lighting: LIGHTS[0],
+    rain: 0,
+  });
+  scene.add(rain.object3d);
 
   // --- Ship ------------------------------------------------------------------
   const hull = new Hull({
@@ -200,6 +233,31 @@ async function boot() {
 
   const ship = createShipMesh();
   scene.add(ship.group);
+
+  // --- Scars -----------------------------------------------------------------
+  // The foam field and the wake stamper belong to the other half of this round
+  // and may not have landed yet. Every line here is guarded, so the workbench
+  // boots and looks right with any subset of them present — the property that
+  // has saved this demo every round so far. `wakeStamper` may hand back either
+  // a function to call each frame or an object with an `update`; both are taken.
+  let foam = null;
+  let wake = null;
+  try {
+    foam = lib.createFoamField?.(field, {
+      size: IS_COARSE ? 512 : 1024,
+      extent: 2400,
+      windFromDeg: WIND_FROM_DEG,
+    }) ?? null;
+
+    if (foam) {
+      ocean.setFoamField?.(foam);
+      wake = lib.wakeStamper?.(hull, foam) ?? null;
+    }
+  } catch (err) {
+    console.warn('No foam field; the sea will heal the instant a crest passes.', err);
+    foam = null;
+    wake = null;
+  }
 
   // --- Controls --------------------------------------------------------------
   const held = new Set();
@@ -247,6 +305,10 @@ async function boot() {
   function onKeyDown(e) {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
 
+    // A slider under the fingers owns the arrow keys; the helm must not also
+    // take them, or nudging the sun a degree puts the wheel hard over.
+    if (e.target instanceof HTMLElement && e.target.closest('#panel')) return;
+
     const digit = PRESETS[Number(e.code.replace('Digit', '')) - 1];
     if (e.code.startsWith('Digit') && digit) {
       setPreset(digit);
@@ -261,8 +323,12 @@ async function boot() {
         note(`View: ${VIEWS[viewIndex]}`);
         break;
       case 'KeyL':
-        applyLighting((lightIndex + 1) % LIGHTS.length);
+        applyPreset((lightIndex + 1) % LIGHTS.length);
         note(`Light: ${LIGHTS[lightIndex].label}`);
+        break;
+      case 'KeyE':
+        panel.hidden = !panel.hidden;
+        note(panel.hidden ? 'Weather panel closed' : 'Weather panel — E to close');
         break;
       case 'Space':
         rudder = 0;
@@ -290,27 +356,17 @@ async function boot() {
     field.setSeaState(seaState);
     ocean.setSeaState(seaState);
     spray.setSeaState(seaState);
+    // The rain reads the surface and the wind fresh every frame, so it needs
+    // only to be told the wind may have changed. Guarded, like everything the
+    // other half of the round owns.
+    rain.setSeaState?.(seaState);
+    foam?.setSeaState?.(seaState);
     // The air takes its wind from the sea state, so it would follow along by
     // itself; building it anew starts the gusts fresh with the new weather.
     air = new AirOverSea(field);
 
     note(`Sea state: ${name} — Hs ${significantHeight(seaState).toFixed(1)} m`);
   }
-
-  function applyLighting(index) {
-    lightIndex = index;
-    const light = LIGHTS[index];
-    ocean.setLighting(light);
-    spray.setLighting(light);
-    sky.set(light);
-    sunLight.color.setHex(light.sunColour);
-    sunLight.intensity = light.sunIntensity;
-    sunLight.position.set(...light.sunDir).normalize().multiplyScalar(1000);
-    ambientLight.color.setHex(light.skyHaze);
-    ambientLight.groundColor.setHex(light.water.deep);
-  }
-
-  applyLighting(0);
 
   // --- Camera ----------------------------------------------------------------
 
@@ -389,6 +445,7 @@ async function boot() {
 
   const ui = {
     preset: el('vPreset'), wind: el('vWind'), light: el('vLight'), view: el('vView'),
+    weather: el('vWeather'),
     speed: el('vSpeed'), heading: el('vHeading'), surf: el('vSurf'),
     rudder: el('vRudder'), authority: el('vAuthority'), risk: el('vRisk'),
     helmFill: el('helmFill'), authFill: el('authFill'),
@@ -435,7 +492,8 @@ async function boot() {
 
     ui.preset.textContent = `${presetName} · Hs ${significantHeight(seaState).toFixed(1)} m`;
     ui.wind.textContent = `${WIND_FROM_DEG}° · ${(air.windSpeed ?? 0).toFixed(1)} m/s`;
-    ui.light.textContent = LIGHTS[lightIndex].label;
+    // The light and weather rows belong to the panel: it writes them whenever
+    // the environment changes, which is the only time they can move.
     ui.view.textContent = VIEWS[viewIndex];
     ui.speed.textContent = `${speed.toFixed(1)} m/s · ${(speed * 1.944).toFixed(1)} kn · thrust ${(thrust * 100) | 0}%`;
     ui.heading.textContent = `${heading.toFixed(0)}° ${COMPASS[Math.round(heading / 22.5) % 16]}`;
@@ -449,6 +507,318 @@ async function boot() {
     ui.authority.textContent = `${(authority * 100) | 0}%`;
     ui.risk.textContent = `${(risk * 100) | 0}%`;
   }
+
+  // --- Weather ---------------------------------------------------------------
+  //
+  // One object holds everything the panel can change, and one function turns it
+  // into the single lighting object that the sky, the sea, the spray, the rain
+  // and the scene lights all read. That is the whole discipline of this
+  // section: the couplings live in `deriveLighting` and nowhere else. No shader
+  // knows it is raining — it is handed thicker fog and greyer colours, and it
+  // draws them exactly as it would have drawn a duller afternoon.
+
+  const panel = el('panel');
+
+  /** A compass bearing and an altitude, as a direction. North is -Z. */
+  function sunVector(azimuthDeg, elevationDeg) {
+    const az = THREE.MathUtils.degToRad(azimuthDeg);
+    const alt = THREE.MathUtils.degToRad(elevationDeg);
+    const flat = Math.cos(alt);
+    return [Math.sin(az) * flat, Math.sin(alt), -Math.cos(az) * flat];
+  }
+
+  /** The same, backwards, so a preset's hand-written vector can fill sliders. */
+  function sunAngles(dir) {
+    const v = new THREE.Vector3(...dir).normalize();
+    return {
+      azimuth: (THREE.MathUtils.radToDeg(Math.atan2(v.x, -v.z)) + 360) % 360,
+      elevation: THREE.MathUtils.radToDeg(Math.asin(clamp(v.y, -1, 1))),
+    };
+  }
+
+  // Visibility and fog density are one number seen from opposite ends. The
+  // shader fogs a thing out at about `3 / density` metres, and a seaman thinks
+  // in miles of visibility rather than in exponents — so the slider is labelled
+  // visibility, and this is where it becomes the multiplier on the base density
+  // that the lighting object actually carries.
+  const fogFromVisibility = (km) => 3 / (Math.max(km, 0.1) * 1000) / BASE_FOG;
+  const visibilityFromFog = (mult) => 3 / (Math.max(mult, 1e-4) * BASE_FOG) / 1000;
+
+  /** `0x67737f` and `'#67737f'` are the same colour; the pickers want the latter. */
+  const hex = (value) =>
+    typeof value === 'number' ? `#${value.toString(16).padStart(6, '0')}` : String(value);
+
+  function weatherFromPreset(light) {
+    const { azimuth, elevation } = sunAngles(light.sunDir);
+    return {
+      label: light.label,
+      sunAzimuthDeg: Math.round(azimuth),
+      sunElevationDeg: Math.round(elevation * 2) / 2,
+      glare: light.glare,
+      exposure: light.exposure,
+      visibilityKm: Math.round(visibilityFromFog(light.fogDensity) * 2) / 2,
+      rain: light.rain ?? 0,
+      sunIntensity: light.sunIntensity,
+      ambient: hex(light.ambient),
+      skyTop: hex(light.skyTop),
+      skyHaze: hex(light.skyHaze),
+      sunColour: hex(light.sunColour),
+      water: {
+        deep: hex(light.water.deep),
+        crest: hex(light.water.crest),
+        foam: hex(light.water.foam),
+      },
+    };
+  }
+
+  const weather = weatherFromPreset(LIGHTS[0]);
+
+  /**
+   * A colour drained toward its own grey: saturation goes, brightness stays.
+   * Draining toward black instead would make a squall a lighting change as well
+   * as a weather one, and the exposure slider is what that is for.
+   */
+  function drained(value, amount) {
+    const c = new THREE.Color(value);
+    if (amount > 0) {
+      const luma = c.r * 0.2126 + c.g * 0.7152 + c.b * 0.0722;
+      c.lerp(new THREE.Color(luma, luma, luma), amount);
+    }
+    return c;
+  }
+
+  /** The panel's numbers, as the lighting object every consumer understands. */
+  function deriveLighting() {
+    const r = clamp(weather.rain, 0, 1);
+
+    // Rain, coupled, once. The air thickens by up to two and a bit times, and a
+    // quarter of the colour goes out of the sky and the water — a squall is
+    // grey and it greys everything under it. The sun's own colour is left
+    // alone: that is the light being made, not a surface standing in the rain.
+    const fogDensity = fogFromVisibility(weather.visibilityKm) * (1 + 1.2 * r);
+    const desat = 0.25 * r;
+
+    return {
+      label: weather.label,
+      sunDir: sunVector(weather.sunAzimuthDeg, weather.sunElevationDeg),
+      sunColour: drained(weather.sunColour, 0),
+      sunIntensity: weather.sunIntensity,
+      ambient: weather.ambient,
+      skyTop: drained(weather.skyTop, desat),
+      skyHaze: drained(weather.skyHaze, desat),
+      glare: weather.glare,
+      exposure: weather.exposure,
+      fogDensity,
+      rain: r,
+      water: {
+        deep: drained(weather.water.deep, desat),
+        crest: drained(weather.water.crest, desat),
+        foam: drained(weather.water.foam, desat),
+      },
+    };
+  }
+
+  let lighting = deriveLighting();
+
+  /**
+   * Push the derived environment at everything that draws.
+   *
+   * The one call that matters for cost is `sky.updateReflection`. The cube is
+   * re-rendered here and only here — a change of lighting is the only thing
+   * that can make it wrong — and sky.js returns immediately when nothing has
+   * moved, so a still frame pays nothing and dragging a slider pays for one
+   * small cube per event.
+   */
+  function applyEnvironment() {
+    lighting = deriveLighting();
+
+    sky.setLighting(lighting);
+    ocean.setLighting(lighting);
+    spray.setLighting(lighting);
+    rain.setLighting(lighting);
+    rain.setWeather({ rain: lighting.rain });
+
+    sunLight.color.set(lighting.sunColour);
+    sunLight.intensity = lighting.sunIntensity;
+    sunLight.position.set(...lighting.sunDir).normalize().multiplyScalar(1000);
+    ambientLight.color.set(lighting.skyHaze);
+    ambientLight.groundColor.set(lighting.water.deep);
+
+    const cube = sky.updateReflection(renderer);
+    if (cube) ocean.setReflection?.(cube, SKY_REFLECT);
+
+    syncPanel();
+    store();
+  }
+
+  function applyPreset(index) {
+    lightIndex = index;
+    Object.assign(weather, weatherFromPreset(LIGHTS[index]));
+    applyEnvironment();
+  }
+
+  // --- The panel -------------------------------------------------------------
+
+  const SLIDERS = [
+    { key: 'sunAzimuthDeg', input: 'wAzimuth', out: 'wAzimuthV',
+      text: (v) => `${v.toFixed(0)}° ${COMPASS[Math.round(v / 22.5) % 16]}` },
+    { key: 'sunElevationDeg', input: 'wElevation', out: 'wElevationV',
+      text: (v) => `${v.toFixed(1)}°` },
+    { key: 'glare', input: 'wGlare', out: 'wGlareV', text: (v) => v.toFixed(2) },
+    { key: 'exposure', input: 'wExposure', out: 'wExposureV', text: (v) => v.toFixed(2) },
+    { key: 'visibilityKm', input: 'wVisibility', out: 'wVisibilityV',
+      text: (v) => `${v.toFixed(1)} km` },
+    { key: 'rain', input: 'wRain', out: 'wRainV',
+      text: (v) => (v <= 0 ? 'dry' : `${Math.round(v * 100)}%`) },
+  ];
+
+  // Paths rather than keys, because three of the six live under `water`.
+  const SWATCHES = [
+    { path: ['skyTop'], input: 'wSkyTop' },
+    { path: ['skyHaze'], input: 'wSkyHaze' },
+    { path: ['sunColour'], input: 'wSunColour' },
+    { path: ['water', 'deep'], input: 'wDeep' },
+    { path: ['water', 'crest'], input: 'wCrest' },
+    { path: ['water', 'foam'], input: 'wFoam' },
+  ];
+
+  const readPath = (path) => path.reduce((o, k) => o[k], weather);
+  const writePath = (path, value) => {
+    const leaf = path[path.length - 1];
+    path.slice(0, -1).reduce((o, k) => o[k], weather)[leaf] = value;
+  };
+
+  function syncPanel() {
+    el('wState').textContent = weather.label;
+    for (const s of SLIDERS) {
+      el(s.input).value = String(weather[s.key]);
+      el(s.out).textContent = s.text(weather[s.key]);
+    }
+    for (const s of SWATCHES) el(s.input).value = readPath(s.path);
+
+    ui.light.textContent = weather.label;
+    ui.weather.textContent = `${
+      weather.rain > 0 ? `rain ${Math.round(weather.rain * 100)}%` : 'dry'
+    } · vis ${weather.visibilityKm.toFixed(0)} km`;
+  }
+
+  for (const s of SLIDERS) {
+    el(s.input).addEventListener('input', (e) => {
+      weather[s.key] = Number(e.target.value);
+      // The moment a control is touched this is nobody's preset any more.
+      weather.label = 'Custom';
+      applyEnvironment();
+    });
+  }
+
+  for (const s of SWATCHES) {
+    el(s.input).addEventListener('input', (e) => {
+      writePath(s.path, e.target.value);
+      weather.label = 'Custom';
+      applyEnvironment();
+    });
+  }
+
+  /**
+   * The environment, as something that can be pasted back into `LIGHTS` above.
+   * Both halves go out: the derived lighting object a game would consume, and
+   * the raw panel state that produced it, so a tuning session can be resumed.
+   */
+  function environmentJson() {
+    const env = deriveLighting();
+    const asHex = (c) => `#${c.getHexString()}`;
+    return JSON.stringify(
+      {
+        label: weather.label,
+        sunIntensity: env.sunIntensity,
+        sunDir: env.sunDir.map((v) => Number(v.toFixed(4))),
+        sunColour: asHex(env.sunColour),
+        skyTop: asHex(env.skyTop),
+        skyHaze: asHex(env.skyHaze),
+        ambient: env.ambient,
+        fogDensity: Number(env.fogDensity.toFixed(4)),
+        glare: env.glare,
+        exposure: env.exposure,
+        rain: env.rain,
+        water: {
+          deep: asHex(env.water.deep),
+          crest: asHex(env.water.crest),
+          foam: asHex(env.water.foam),
+        },
+        weather: { ...weather, water: { ...weather.water } },
+      },
+      null,
+      2
+    );
+  }
+
+  el('wCopy').addEventListener('click', async () => {
+    const text = environmentJson();
+    const box = el('wJson');
+    try {
+      await navigator.clipboard.writeText(text);
+      box.hidden = true;
+      note('Environment copied to the clipboard');
+      return;
+    } catch {
+      // No clipboard permission, or an insecure origin. Show the text and
+      // select it, which is the oldest fallback there is and still the surest.
+    }
+    box.value = text;
+    box.hidden = false;
+    box.focus();
+    box.select();
+    note('Clipboard refused — the JSON is selected below; copy it by hand');
+  });
+
+  // A custom sky survives a reload, because tuning one is half an hour's work
+  // and losing it to a stray refresh is the whole reason nobody tunes anything.
+  function store() {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(weather));
+    } catch {
+      // A private window, a full quota, storage switched off entirely: none of
+      // them is a reason for the workbench not to run.
+    }
+  }
+
+  function restore() {
+    let saved = null;
+    try {
+      saved = JSON.parse(localStorage.getItem(STORE_KEY) ?? 'null');
+    } catch {
+      saved = null;
+    }
+    if (!saved || typeof saved !== 'object') return false;
+
+    // Anything in storage is untrusted: it may be from an older shape of this
+    // file, or from a hand that edited it. Every field is checked, and a bad
+    // one keeps the preset's value rather than poisoning a uniform.
+    const num = (v, lo, hi, fallback) => (Number.isFinite(v) ? clamp(v, lo, hi) : fallback);
+    const col = (v, fallback) => (/^#[0-9a-f]{6}$/i.test(v) ? v : fallback);
+
+    if (typeof saved.label === 'string') weather.label = saved.label.slice(0, 32);
+    weather.sunAzimuthDeg = num(saved.sunAzimuthDeg, 0, 360, weather.sunAzimuthDeg);
+    weather.sunElevationDeg = num(saved.sunElevationDeg, -5, 60, weather.sunElevationDeg);
+    weather.glare = num(saved.glare, 0, 1, weather.glare);
+    weather.exposure = num(saved.exposure, 0.4, 2, weather.exposure);
+    weather.visibilityKm = num(saved.visibilityKm, 1, 40, weather.visibilityKm);
+    weather.rain = num(saved.rain, 0, 1, weather.rain);
+    weather.sunIntensity = num(saved.sunIntensity, 0, 6, weather.sunIntensity);
+    weather.ambient = col(saved.ambient, weather.ambient);
+    weather.skyTop = col(saved.skyTop, weather.skyTop);
+    weather.skyHaze = col(saved.skyHaze, weather.skyHaze);
+    weather.sunColour = col(saved.sunColour, weather.sunColour);
+    weather.water.deep = col(saved.water?.deep, weather.water.deep);
+    weather.water.crest = col(saved.water?.crest, weather.water.crest);
+    weather.water.foam = col(saved.water?.foam, weather.water.foam);
+    return true;
+  }
+
+  // Only a *tuned* sky is worth announcing; a preset coming back out of storage
+  // is the same preset the page would have opened on anyway.
+  const restored = restore() && weather.label === 'Custom';
+  applyEnvironment();
 
   // --- Ship mesh -------------------------------------------------------------
 
@@ -564,8 +934,20 @@ async function boot() {
     ocean.update(camera.position);
     // Inside tick, so it advances under window.sea.step() like everything else,
     // and after the camera, because where the spray is spawned depends on where
-    // the eye is and how far above the water it has got.
+    // the eye is and how far above the water it has got. The rain wants the
+    // camera for the same reason: its near layer is a box around the eye.
     spray.update(dt, camera.position);
+    rain.update(dt, camera.position);
+
+    // Scars, last of all and before the draw. The wake is stamped first so that
+    // this frame's trail is in this frame's texture, and the field is stepped
+    // before `renderer.render` because the ocean shader is about to sample it.
+    if (wake) {
+      if (typeof wake === 'function') wake(dt);
+      else wake.update?.(dt);
+    }
+    foam?.update?.(renderer, dt, camera.position);
+
     updateHud(dt);
 
     renderer.render(scene, camera);
@@ -580,7 +962,11 @@ async function boot() {
     tick(Math.min(clock.getDelta(), 1 / 20));
   });
 
-  note(`${presetName} — the sea is running from ${WIND_FROM_DEG}°. Helm view; press C to change.`);
+  note(
+    restored
+      ? `${presetName} — your own sky is back. E for the weather panel, C for the view.`
+      : `${presetName} — the sea is running from ${WIND_FROM_DEG}°. Helm view; press C to change.`
+  );
 
   // A handle for driving the whole thing from the console — and the only way to
   // watch it at all in a tab the browser has decided not to animate, since
@@ -590,13 +976,28 @@ async function boot() {
     hull,
     ocean,
     spray,
+    sky,
+    rain,
+    foam,
+    wake,
     scene,
     camera,
     renderer,
+    panel,
+    weather,
+    applyEnvironment,
+    get lighting() { return lighting; },
     get air() { return air; },
     get seaState() { return seaState; },
     setPreset,
-    setLighting: applyLighting,
+    setLighting: applyPreset,
+    /** `sea.setWeather({ rain: 0.7 })` — the panel's rain slider, by hand. */
+    setWeather(next = {}) {
+      Object.assign(weather, next);
+      if (Object.keys(next).length) weather.label = 'Custom';
+      applyEnvironment();
+      return weather;
+    },
     step(frames = 1, dt = 1 / 60) {
       for (let i = 0; i < frames; i++) tick(dt);
       return { time: field.time, position: hull.position, headingDeg: hull.headingDeg };
@@ -605,87 +1006,6 @@ async function boot() {
 }
 
 // --- Odds and ends -----------------------------------------------------------
-
-/**
- * A gradient dome, adapted from the reference game's sky: two overlapping
- * ramps rather than one, because a single smoothstep leaves a visible seam
- * across the sky exactly where the eye is already looking. Its haze colour is
- * the colour the ocean fogs to, so the sea dissolves into the sky instead of
- * ending at a line.
- */
-function createSky() {
-  const uniforms = {
-    uTop: { value: new THREE.Color(0x67737f) },
-    uHaze: { value: new THREE.Color(0xa6abab) },
-    uSunDir: { value: new THREE.Vector3(0.35, 0.3, 0.65) },
-    uSunColour: { value: new THREE.Color(0xdfe2de) },
-    uGlare: { value: 0.3 },
-    uExposure: { value: 1.0 },
-  };
-
-  const material = new THREE.ShaderMaterial({
-    uniforms,
-    side: THREE.BackSide,
-    depthWrite: false,
-    vertexShader: /* glsl */ `
-      varying vec3 vDir;
-      void main() {
-        vDir = position;
-        // Strip translation from the view matrix so the dome never moves
-        // relative to the camera, then force depth to the far plane.
-        mat4 rotOnly = mat4(mat3(viewMatrix));
-        vec4 pos = projectionMatrix * rotOnly * vec4(position, 1.0);
-        gl_Position = pos.xyww;
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      uniform vec3 uTop;
-      uniform vec3 uHaze;
-      uniform vec3 uSunDir;
-      uniform vec3 uSunColour;
-      uniform float uGlare;
-      uniform float uExposure;
-
-      varying vec3 vDir;
-
-      ${agxToneMapChunk}
-
-      void main() {
-        vec3 d = normalize(vDir);
-
-        float t = smoothstep(-0.16, 0.55, d.y);
-        float t2 = smoothstep(-0.02, 0.16, d.y);
-        vec3 col = mix(uHaze, uTop, t * 0.72 + t2 * 0.28);
-
-        // A broad, gentle glow rather than a disc — calmer, and it never glares.
-        float sun = max(0.0, dot(d, normalize(uSunDir)));
-        col += uSunColour * pow(sun, 16.0) * 0.16 * uGlare;
-        col += uSunColour * pow(sun, 220.0) * 0.40 * uGlare;
-
-        gl_FragColor = vec4(agxToneMap(col, uExposure), 1.0);
-
-        #include <colorspace_fragment>
-      }
-    `,
-  });
-
-  const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 16), material);
-  mesh.frustumCulled = false;
-  mesh.renderOrder = -1000;
-  mesh.name = 'sky';
-
-  return {
-    mesh,
-    set(light) {
-      uniforms.uTop.value.setHex(light.skyTop);
-      uniforms.uHaze.value.setHex(light.skyHaze);
-      uniforms.uSunDir.value.set(...light.sunDir).normalize();
-      uniforms.uSunColour.value.setHex(light.sunColour);
-      uniforms.uGlare.value = light.glare ?? 0.4;
-      uniforms.uExposure.value = light.exposure ?? 1.0;
-    },
-  };
-}
 
 /** Significant wave height: four standard deviations of the surface. */
 function significantHeight(seaState) {

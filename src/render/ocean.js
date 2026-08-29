@@ -168,9 +168,12 @@ export const agxToneMapChunk = /* glsl */ `
  *
  * Generated rather than constant, because the near-field normal pass needs the
  * wave table compiled in at the right length — and because a caller who has
- * turned that pass off should not be paying for the uniforms either.
+ * turned that pass off should not be paying for the uniforms either. The foam
+ * field and the sky reflection are compiled in the same way and for the same
+ * reason: a phone with no foam field is running the shader it ran before either
+ * of them existed, down to the uniform declarations.
  */
-const fragmentShader = (waveCount, normalRange) => /* glsl */ `
+const fragmentShader = (waveCount, normalRange, features = {}) => /* glsl */ `
   ${normalRange > 0 ? oceanNormalChunk(waveCount) : ''}
   ${skyGradientChunk}
   ${agxToneMapChunk}
@@ -199,7 +202,17 @@ const fragmentShader = (waveCount, normalRange) => /* glsl */ `
   uniform float uFoamScale;    // foam texture frequency, from the dominant wave
   uniform float uRipple;       // strength of the wind-texture normal
   uniform float uExposure;     // stops in front of the tone map
-
+${features.foamField ? `
+  // The scar field: one channel of accumulated white water, world-anchored on a
+  // footprint that follows the camera. See render/foamfield.js.
+  uniform sampler2D uFoamField;
+  uniform vec2 uFoamOrigin;    // world xz of the footprint's near corner
+  uniform float uFoamInvExtent;
+  uniform float uFoamAmount;   // 0 falls back to the analytic foam entirely
+` : ''}${features.reflection ? `
+  uniform samplerCube uSkyRefl;
+  uniform float uSkyReflAmount; // 0 = the procedural ramp, exactly as before
+` : ''}
   varying vec3 vNormal;
   varying vec3 vWorldPos;
   varying float vCrest;
@@ -296,7 +309,21 @@ ${normalRange > 0 ? `
     // is actually there rather than an approximation of it.
     vec3 reflDir = reflect(-viewDir, n);
     vec3 skyCol = skyGradient(reflDir, uSkyHaze, uSkyTop, sun, uSunColour, uGlare);
-
+${features.reflection ? `
+    // Better than the ramp: the sky dome that is actually overhead, prefiltered
+    // into a cube and sampled along the reflected ray, so the sun sits where the
+    // sun is and the dusk orange arrives in the wave backs by itself. Rough
+    // water is a poor mirror and a pinched crest is the roughest water there is,
+    // so the sample is pushed down the mip chain by the very pinch the foam keys
+    // off — a bias rather than an exact LOD, which is all the difference a sea
+    // this broken could show anyway.
+    if (uSkyReflAmount > 0.0) {
+      float rough = clamp(0.3 + uRipple * 1.4
+                        + 0.9 * smoothstep(0.0, uFoamHi, vCrest), 0.0, 1.0);
+      skyCol = mix(skyCol, textureCube(uSkyRefl, reflDir, rough * 5.0).rgb,
+                   uSkyReflAmount);
+    }
+` : ''}
     vec3 col = mix(water, skyCol, fresnel);
 
     // Sun glint: one tight and one broad lobe, so there is both sparkle and
@@ -308,9 +335,25 @@ ${normalRange > 0 ? `
 
     // --- Foam ---------------------------------------------------------------
     // Breaking crests, where the Gerstner pinch says the surface is folding.
-    // Faded hard with distance, or every far crest becomes a solid white bar.
+    // Faded hard with distance, or every far crest becomes a solid white bar —
+    // the field's scars included, since they are the same white water.
     float rag = fbm(vUndisp * 0.13 * uFoamScale + uWindDir * uTime * -0.5);
-    float crestFoam = smoothstep(uFoamLo, uFoamHi, vCrest + (rag - 0.5) * uFoamJitter);
+    float crestFoam = smoothstep(uFoamLo, uFoamHi, vCrest + (rag - 0.5) * uFoamJitter);${features.foamField ? `
+
+    // What this piece of sea remembers. Sampled at the datum footprint, which
+    // is where the field's own pass evaluated the crest sum, so the scar and the
+    // crest that made it are anchored to the same water. Whitest wins: the field
+    // can only ever add memory to the analytic answer, never take white away
+    // from a crest that is breaking right now. Outside the footprint it fades
+    // out over a few per cent of the edge and the analytic foam carries on
+    // alone, so there is no line on the water where the texture stops.
+    vec2 ffUv = (vUndisp - uFoamOrigin) * uFoamInvExtent;
+    vec2 ffEdge = min(ffUv, 1.0 - ffUv);
+    float ffFade = smoothstep(0.0, 0.045, min(ffEdge.x, ffEdge.y));
+    // Squared, not linear: a half-faded memory should read as lace on the
+    // water, not as half a coat of paint. Fresh white is still fresh white.
+    float ffScar = texture2D(uFoamField, ffUv).r;
+    crestFoam = max(crestFoam, ffScar * ffScar * uFoamAmount * ffFade);` : ''}
     crestFoam *= 0.22 + 0.78 * exp(-dist / 5500.0);
 
     // Spindrift: old foam drawn out downwind in long lace streaks — narrow
@@ -357,7 +400,7 @@ ${normalRange > 0 ? `
  * is what makes the shader sea-state agnostic: at the storm preset the numbers
  * below land within a percent or two of the hand-tuned constants they replaced.
  */
-function foamProfile(sea) {
+export function foamProfile(sea) {
   const waves = sea?.waves ?? [];
 
   let heightVar = 0;
@@ -414,10 +457,12 @@ function setColour(uniform, value) {
  * @param waveField  a WaveField; its `sea` supplies the spectrum and its `time`
  *                   the clock, so the mesh can never drift out of step with the
  *                   physics reading the same field.
- * @param options    { quality, windFromDeg, fogDensity, lighting }
+ * @param options    { quality, windFromDeg, fogDensity, lighting, foamField }
  *                   quality: { gridN, halfSpan, exponent, normalRange }
  *                   lighting: { sunDir, sunColour, skyTop, skyHaze, glare,
  *                               fogDensity, exposure, water }
+ *                   foamField: a createFoamField, or nothing at all — see
+ *                              `setFoamField` below.
  */
 export function createOcean(waveField, options = {}) {
   const quality = { ...DEFAULT_QUALITY, ...(options.quality ?? {}) };
@@ -456,22 +501,51 @@ export function createOcean(waveField, options = {}) {
     uFoamScale: { value: 1 },
     uRipple: { value: 0.3 },
     uExposure: { value: 1 },
+    // Only ever read by a material that has the reflection compiled into it;
+    // kept here always so `setReflection` has somewhere to put its answer.
+    uSkyRefl: { value: null },
+    uSkyReflAmount: { value: 0 },
   };
 
   // Nought disables the near-field normal pass; anything else is a range in
   // metres, and the shader is generated around it.
   const normalRange = Math.max(0, quality.normalRange ?? 0);
 
+  // The two optional layers. Both are compiled in rather than switched at
+  // runtime, so an ocean with neither is byte for byte the shader it was before
+  // either existed — no sampler bound, no uniform declared, nothing to pay for.
+  // The names of the uniform objects are fixed by Amendment II because two
+  // agents build against them from opposite sides.
+  const FIELD_UNIFORMS = ['uFoamField', 'uFoamOrigin', 'uFoamInvExtent', 'uFoamAmount'];
+  let foamField = null;
+  let reflection = null;
+
+  /** Adopt the field's own uniform objects: it ping-pongs its render targets
+   *  every update, and this is what saves the sea from being told about it. */
+  function adoptFoamField(next) {
+    for (const key of FIELD_UNIFORMS) delete uniforms[key];
+    foamField = next ?? null;
+    if (!foamField) return;
+    for (const key of FIELD_UNIFORMS) {
+      uniforms[key] = foamField.uniforms?.[key] ?? { value: null };
+    }
+  }
+
   const makeMaterial = () =>
     new THREE.ShaderMaterial({
       vertexShader: vertexShader(waveCount),
-      fragmentShader: fragmentShader(waveCount, normalRange),
+      fragmentShader: fragmentShader(waveCount, normalRange, {
+        foamField: foamField !== null,
+        reflection: reflection !== null,
+      }),
       uniforms,
       // The tone curve is applied in the shader, on the assembled scene value.
       // Say so, or a renderer with its own tone mapping switched on will grade
       // the sea a second time.
       toneMapped: false,
     });
+
+  adoptFoamField(options.foamField);
 
   const material = makeMaterial();
 
@@ -515,6 +589,14 @@ export function createOcean(waveField, options = {}) {
     uniforms.uExposure.value = lighting.exposure ?? 1;
   }
 
+  /** Swap the material for one generated around the flags as they now stand.
+   *  The uniform map is the same object, so nothing has to be re-uploaded. */
+  function rebuild() {
+    const replacement = makeMaterial();
+    mesh.material.dispose();
+    mesh.material = replacement;
+  }
+
   applyFoam();
   setLighting(options.lighting ?? {});
 
@@ -533,6 +615,43 @@ export function createOcean(waveField, options = {}) {
     setLighting,
 
     /**
+     * Give the sea a memory, or take it away again.
+     *
+     * With a field set, the foam term becomes the whitest of the analytic
+     * answer and the field's — so broken water stays broken until the field
+     * fades it — and inside the footprint only, with a soft edge back to the
+     * analytic foam beyond. With `null` the shader is regenerated without any
+     * of it: no sampler, no uniforms, not a cycle spent. That is the phone
+     * path, and it is why this is a recompile rather than a branch.
+     *
+     * The field's own uniform objects are adopted rather than copied, because
+     * it ping-pongs two render targets and the texture changes every update.
+     */
+    setFoamField(foamOrNull) {
+      const had = foamField !== null;
+      adoptFoamField(foamOrNull);
+      if (had !== (foamField !== null)) rebuild();
+    },
+
+    /**
+     * Reflect a real sky instead of a ramp that resembles one.
+     *
+     * @param cubeTexture  a mipmapped cube — `createSky().reflection` — or null
+     *                     to go back to the procedural gradient.
+     * @param amount       0..1, how far the ramp is mixed toward it. Zero is
+     *                     the shipped look exactly; the branch is compiled in
+     *                     as soon as there is a texture, so a game may animate
+     *                     the amount from nought without a recompile.
+     */
+    setReflection(cubeTexture, amount = 1) {
+      const had = reflection !== null;
+      reflection = cubeTexture ?? null;
+      uniforms.uSkyRefl.value = reflection;
+      uniforms.uSkyReflAmount.value = reflection ? clamp(amount, 0, 1) : 0;
+      if (had !== (reflection !== null)) rebuild();
+    },
+
+    /**
      * Swap the spectrum under a running sea.
      *
      * The wave tables are plain arrays inside the uniform objects, so a sea of
@@ -548,9 +667,7 @@ export function createOcean(waveField, options = {}) {
       if (sea.waves.length !== waveCount) {
         waveCount = sea.waves.length;
         for (const key of Object.keys(fresh)) uniforms[key] = fresh[key];
-        const replacement = makeMaterial();
-        mesh.material.dispose();
-        mesh.material = replacement;
+        rebuild();
       } else {
         for (const key of Object.keys(fresh)) uniforms[key].value = fresh[key].value;
       }
