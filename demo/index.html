@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>surprise-sea — workbench</title>
+    <style>
+      /* The rig, not the product: plain DOM over the canvas, no framework, no
+         build step of its own. Everything here is meant to be read at a glance
+         while one hand is on the helm. */
+      :root {
+        --ink: #dfe4e4;
+        --dim: #8f9a9c;
+        --panel: rgba(12, 18, 22, 0.62);
+        --edge: rgba(223, 228, 228, 0.18);
+        --good: #7fb7a4;
+        --warn: #e2a273;
+        --bad: #d9534f;
+      }
+
+      * { box-sizing: border-box; }
+
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #0b1116;
+        color: var(--ink);
+        font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      #scene { display: block; width: 100%; height: 100%; touch-action: none; }
+
+      .hud {
+        position: fixed;
+        background: var(--panel);
+        border: 1px solid var(--edge);
+        border-radius: 6px;
+        padding: 10px 12px;
+        backdrop-filter: blur(6px);
+        pointer-events: none;
+        user-select: none;
+      }
+
+      #readout {
+        top: 12px;
+        left: 12px;
+        min-width: 264px;
+      }
+
+      #readout .row {
+        display: flex;
+        justify-content: space-between;
+        gap: 18px;
+        white-space: nowrap;
+      }
+
+      #readout .k { color: var(--dim); }
+      #readout .v { text-align: right; }
+
+      #readout hr {
+        border: 0;
+        border-top: 1px solid var(--edge);
+        margin: 8px 0 7px;
+      }
+
+      .gauge { margin-top: 7px; }
+      .gauge .label {
+        display: flex;
+        justify-content: space-between;
+        color: var(--dim);
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .track {
+        position: relative;
+        height: 7px;
+        margin-top: 3px;
+        border: 1px solid var(--edge);
+        border-radius: 3px;
+        overflow: hidden;
+        background: rgba(0, 0, 0, 0.3);
+      }
+
+      .track i {
+        display: block;
+        height: 100%;
+        width: 0%;
+        background: var(--good);
+        transition: width 60ms linear;
+      }
+
+      /* The helm reads either side of amidships, so its fill grows from the
+         centre out rather than from the left. */
+      #helmTrack i {
+        position: absolute;
+        left: 50%;
+        width: 0%;
+        background: var(--ink);
+      }
+
+      #helmTrack::after {
+        content: '';
+        position: absolute;
+        left: 50%;
+        top: 0;
+        bottom: 0;
+        width: 1px;
+        background: var(--edge);
+      }
+
+      #riskFill { background: var(--warn); }
+
+      /* A broach or a sea over the taffrail is the one thing that must be
+         impossible to miss from the corner of an eye. */
+      #riskTrack.alarm {
+        animation: alarm 0.24s steps(1) 4;
+      }
+      @keyframes alarm {
+        50% { background: var(--bad); box-shadow: 0 0 12px var(--bad); }
+      }
+
+      #log {
+        left: 12px;
+        bottom: 46px;
+        max-width: min(540px, calc(100vw - 24px));
+        color: var(--dim);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #log b { color: var(--ink); font-weight: 600; }
+
+      #keys {
+        left: 12px;
+        bottom: 12px;
+        color: var(--dim);
+        font-size: 11px;
+        max-width: calc(100vw - 24px);
+        white-space: normal;
+      }
+      #keys kbd {
+        color: var(--ink);
+        border: 1px solid var(--edge);
+        border-radius: 3px;
+        padding: 0 4px;
+      }
+
+      #fault {
+        display: none;
+        position: fixed;
+        inset: 0;
+        place-content: center;
+        padding: 8vh 8vw;
+        background: #0b1116;
+        color: var(--ink);
+        white-space: pre-wrap;
+      }
+      #fault.shown { display: grid; }
+      #fault b { color: var(--warn); }
+    </style>
+  </head>
+  <body>
+    <canvas id="scene"></canvas>
+
+    <div class="hud" id="readout">
+      <div class="row"><span class="k">Sea</span><span class="v" id="vPreset">—</span></div>
+      <div class="row"><span class="k">Wind</span><span class="v" id="vWind">—</span></div>
+      <div class="row"><span class="k">Light</span><span class="v" id="vLight">—</span></div>
+      <div class="row"><span class="k">View</span><span class="v" id="vView">—</span></div>
+      <hr />
+      <div class="row"><span class="k">Speed</span><span class="v" id="vSpeed">—</span></div>
+      <div class="row"><span class="k">Heading</span><span class="v" id="vHeading">—</span></div>
+      <div class="row"><span class="k">Surf</span><span class="v" id="vSurf">—</span></div>
+
+      <div class="gauge">
+        <div class="label"><span>Helm</span><span id="vRudder">amidships</span></div>
+        <div class="track" id="helmTrack"><i id="helmFill"></i></div>
+      </div>
+
+      <div class="gauge">
+        <div class="label"><span>Rudder authority</span><span id="vAuthority">—</span></div>
+        <div class="track"><i id="authFill"></i></div>
+      </div>
+
+      <div class="gauge">
+        <div class="label"><span>Broach risk</span><span id="vRisk">—</span></div>
+        <div class="track" id="riskTrack"><i id="riskFill"></i></div>
+      </div>
+    </div>
+
+    <div class="hud" id="log">Ready.</div>
+
+    <div class="hud" id="keys">
+      <kbd>←</kbd><kbd>→</kbd>/<kbd>A</kbd><kbd>D</kbd> helm ·
+      <kbd>W</kbd><kbd>S</kbd> canvas ·
+      <kbd>space</kbd> amidships ·
+      <kbd>1</kbd>–<kbd>5</kbd> sea state ·
+      <kbd>C</kbd> camera ·
+      <kbd>L</kbd> light ·
+      drag &amp; wheel in orbit
+    </div>
+
+    <div id="fault"></div>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
