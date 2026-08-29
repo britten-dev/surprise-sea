@@ -1,0 +1,17 @@
+{
+  "name": "surprise-sea",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A reusable Southern Ocean: parametric storm seas, identical on CPU and GPU, with hull seakeeping for ships that must live on them.",
+  "scripts": {
+    "dev": "vite",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "three": "^0.180.0"
+  },
+  "devDependencies": {
+    "vite": "^7.1.0"
+  }
+}

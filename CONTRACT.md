@@ -1,0 +1,253 @@
+# surprise-sea — the contract
+
+A reusable sea for three games: the albatross game (`hms-surprise`), The
+Helmsman's Watch, and The Pursuit. Two halves, one law:
+
+> **The CPU and the GPU must describe the same water.** Physics samples the
+> surface analytically; the renderer displaces a mesh with the same wave sum.
+> A ship or a bird touching the water must touch what the eye sees.
+
+Everything is deterministic: same options → same sea, every run. No
+`Date.now`, no `Math.random` in simulation code — seeded LCGs only. Plain
+JavaScript ES modules, three.js ^0.180 as the only dependency. Comment in the
+voice of the reference code: explain *why*, literately, not what.
+
+Reference implementations to read before writing anything (working code from
+the albatross game — port, generalise, improve; do not import from there):
+
+- `/Users/matthewjamesbates/Documents/Dev/hms-surprise/src/world/ocean/waves.js`
+- `/Users/matthewjamesbates/Documents/Dev/hms-surprise/src/world/ocean/wavefield.js`
+- `/Users/matthewjamesbates/Documents/Dev/hms-surprise/src/world/ocean/ocean.js`
+- `/Users/matthewjamesbates/Documents/Dev/hms-surprise/src/world/ocean/oceanAir.js`
+- `/Users/matthewjamesbates/Documents/Dev/hms-surprise/src/world/ocean/ship.js` (the `update()` motion section)
+- `/Users/matthewjamesbates/Documents/Dev/hms-surprise/src/main.js` (how a game consumes all of it)
+
+## File layout
+
+```
+src/
+  index.js        re-exports the whole public API below
+  spectrum.js     createSeaState(options) → SeaState; the presets live here
+  seastate.js     SeaState class: every CPU query + the GLSL twin
+  wavefield.js    WaveField: the game-facing adapter with time
+  hull.js         Hull: seakeeping, rudder, broach and pooping
+  airoversea.js   AirOverSea: wind, wave lift, streets (for flying things)
+  render/
+    grid.js       warpedGrid(n, halfSpan, exponent) → BufferGeometry
+    ocean.js      createOcean(waveField, options) → { mesh, update, setLighting, setSeaState }
+demo/
+  index.html      the workbench page
+  main.js         scene, test hull, cameras, HUD, input
+test/
+  seastate.test.js
+  hull.test.js
+```
+
+## Physics half (owner: physics agent)
+
+### `createSeaState(options) → SeaState`  (spectrum.js)
+
+```js
+createSeaState({
+  preset,        // 'calm' | 'breeze' | 'gale' | 'storm' | 'greybeards'
+  windFromDeg,   // meteorological; the swell runs downwind. Default 285.
+  seed,          // integer; default 1796. Same seed, same sea.
+  scale,         // overall amplitude multiplier, default 1
+  waveCount,     // default 12
+})
+```
+
+Presets are rough Beaufort anchors — dominant wavelength, significant height,
+directional spread, chop energy:
+
+| preset      | feel                         | Hs (m) | dominant L (m) |
+|-------------|------------------------------|--------|----------------|
+| calm        | glassy heave                 | ~0.4   | ~60            |
+| breeze      | whitecaps starting           | ~2     | ~90            |
+| gale        | heavy, streaked              | ~7     | ~160           |
+| storm       | the albatross game today     | ~12    | ~230           |
+| greybeards  | survival storm, towering     | ~17    | ~320           |
+
+Synthesis rules (learned the hard way in the game):
+
+- **Split the primary train into three near-parallel components** — same
+  neighbourhood of wavelength, ±5–7° heading, slightly different speeds — so
+  the sea arrives in *sets* with lulls between. One clean dominant wave reads
+  as corduroy from any height.
+- Remaining components log-spaced down from the dominant to short chop, with
+  alternating heading offsets widening to ±30°.
+- Deep-water dispersion: ω = √(g·k). Phase, heading jitter, amplitude jitter
+  from the seeded LCG.
+- Gerstner pinch per wave (`q·k·A`) budgeted so the total stays ≤ ~0.8; the
+  pinch is what makes crests sharp and troughs long.
+
+### `SeaState`  (seastate.js)
+
+State: `waves[]` ({dx,dz,k,omega,amp,q,length,phase}), `hMin`, `hMax`,
+`dominant`, `dominantSpeed`, `windFromDeg`, `preset`.
+
+Queries (all take explicit `t` seconds):
+
+- `heightAt(x, z, t)` — exact surface height in the column above (x,z):
+  3 fixed-point iterations inverting the Gerstner horizontal displacement,
+  then the vertical sum. This is the authoritative surface.
+- `roughHeightAt(x, z, t)` — vertical terms only, no inversion. For spray,
+  birds, anything decorative.
+- `gradientAt(x, z, t, spread = 22)` — finite differences of `heightAt`.
+- `normalAt(x, z, t, spread, out?)` — from the gradient, THREE.Vector3.
+- `crestAt(x, z, t)` — Σ q·k·A·sin(θ): how pinched the surface is; foam and
+  spume key off it.
+- `orbitalVelocityAt(x, z, t, out?)` — water particle velocity at the surface
+  (deep-water orbits: u = Σ ω·A·cosθ·d̂ horizontally, w = Σ ω·A·sinθ
+  vertically). Hulls and wakes drift with this.
+
+GPU twin:
+
+- `waveUniforms(seaState)` — uniform arrays uWaveDir/K/Omega/Amp/Q/Len/Phase.
+- `oceanVertexChunk(waveCount)` — the GLSL `gerstner(p, camDist, out normal,
+  out crest)` function, generated for NW = waveCount, with per-wave distance
+  attenuation `exp(-camDist / (L·45 + 600))` so coarse far mesh never aliases.
+
+### `WaveField`  (wavefield.js)
+
+The adapter games hand to everything else. Owns the clock so one frame sees
+one sea.
+
+```js
+const field = new WaveField(seaState, extent /* metres, square */);
+field.advance(dt); field.time;
+field.heightAt(x, z); field.gradientAt(x, z, spread?);
+field.normalAt(x, z, spread?, out?); field.contains(x, z, margin?);
+field.extent; field.half; field.hMin; field.hMax; field.sea;
+field.setSeaState(newSeaState);   // live swap, clock keeps running
+```
+
+### `Hull`  (hull.js) — the seakeeping heart of The Helmsman's Watch
+
+Phenomenological, tunable, honest about being a game model. Weather-ship
+behaviour first, naval architecture second.
+
+```js
+const hull = new Hull({
+  length: 39, beam: 9.9, draught: 4.3,       // metres
+  mass: 500e3,                               // suggests the response taus
+  heaveTau: 1.5, pitchTau: 1.9, rollTau: 2.1,
+  maxSpeed: 6,                                // m/s under current canvas
+  rudderPower: 0.25,                          // rad/s² of yaw at full helm, full flow
+  yawDamping: 0.8,
+  x: 0, z: 0, headingDeg: 105,
+});
+
+hull.update(dt, waveField, {
+  rudder,      // -1..1, port..starboard
+  thrust,      // 0..1 fraction of maxSpeed the canvas is driving her at
+});
+```
+
+Model, per update:
+
+1. Sample `heightAt` at bow, stern, port beam, starboard beam (at ±length·0.35
+   and ±beam·0.45). Targets: heave = mean; pitch = atan(bow−stern / span)·0.85;
+   roll = atan(port−starboard / span)·0.6. Ease each toward its target with
+   its tau (`1 − exp(−dt/τ)`).
+2. **Surge/surf**: fore-aft slope under her; stern-up adds speed (surf),
+   bow-up subtracts. `surfFactor` 0..1 = how hard she is surfing.
+3. **Rudder authority**: proportional to relative flow past the rudder —
+   `authority = clamp(speed / (dominantSpeed·0.5), 0, 1) · (1 − 0.8·surfFactor)`.
+   Surfing at wave speed, the rudder is in water moving with her: near-useless.
+   This is the core feel of the helmsman game.
+4. **Wave yaw**: quartering seas slew the stern — yaw torque from the
+   *athwartships* slope sampled at the stern minus at the bow, multiplied by
+   (1 + 2·surfFactor). Integrate yawRate with damping; heading integrates
+   yawRate.
+5. **Broach**: `broachRisk` 0..1 blends surfFactor, |wave yaw torque| and how
+   far heading is off the wave-travel direction. Risk ≥ 1 latches
+   `broached = true`: yaw kicks hard toward beam-on, roll target gains
+   +0.35 rad, speed decays; recovery (risk fallen and roll settling) clears
+   the latch. Fire `onBroach` callback once per event.
+6. **Pooped**: overtaking crest at the stern above deck height
+   (heave + freeboard) while `surfFactor < 0.3` → `onPooped` once per crest;
+   briefly multiply rudder authority by 0.3.
+7. Expose: `position` (Vector3, y = heave), `quaternion` (yaw·pitch·roll,
+   'YXZ'), `headingDeg`, `speed`, `yawRate`, `surfFactor`, `broachRisk`,
+   `broached`, `rudderAuthority`, plus `onBroach`/`onPooped` callbacks.
+
+### `AirOverSea`  (airoversea.js)
+
+Port of the game's `OceanAir`, parameterised by the sea state (wind speed and
+direction come from it; wave lift reads the field's gradient; streets
+configurable). Same public surface: `update(dt)`, `velocityAt(x,y,z,out)`,
+`wind`, `windSpeed`, `nearbyThermals()` → [], `thermals` → [].
+
+### Tests (node --test, no browser, no new deps)
+
+- Inversion: for `storm` and `greybeards`, |forward(invert(x,z)) − (x,z)| <
+  0.01 m across a grid of points and times; `heightAt` within hMin..hMax.
+- Determinism: two `createSeaState` with the same options produce identical
+  wave tables; different seeds differ.
+- Presets: significant height (4·σ of sampled heights) within ±30% of the
+  table above.
+- Hull: on `calm`, holds heading within 2° over 60 s with rudder 0; full
+  starboard rudder turns her clockwise; in `greybeards` running dead downwind
+  at full thrust, `broachRisk` exceeds 0.5 within 5 minutes but heading
+  recovers after a broach clears; no NaNs anywhere after 10 minutes at dt
+  = 1/60.
+
+## Rendering half (owner: render agent)
+
+### `createOcean(waveField, options)`  (render/ocean.js)
+
+Port of the game's renderer, decoupled from its mood system:
+
+```js
+const ocean = createOcean(waveField, {
+  quality: { gridN: 352, halfSpan: 16000, exponent: 2.2 },
+  windFromDeg: 285,               // streak direction (default from seaState)
+  fogDensity: 1.05e-4,
+  lighting: {                     // everything setLighting() can change later
+    sunDir: [0.35, 0.3, 0.65], sunColour: 0xdfe2de,
+    skyTop: 0x67737f, skyHaze: 0xa6abab, glare: 0.3,
+    fogDensity: 1.15,             // multiplier on the base
+    water: { deep: 0x25383c, crest: 0x3d6a5c, foam: 0xdfe4e4 },
+  },
+});
+ocean.mesh; ocean.update(cameraPos); ocean.setLighting(lighting);
+ocean.setSeaState(seaState);      // re-upload wave uniforms on live swap
+```
+
+Keep every visual lesson already in the reference shader: warped
+camera-following grid; damped fresnel (rough seas are poor mirrors); backlit
+bottle-green crests; crest foam with distance fade so far crests never become
+solid bars; spindrift streaked long and lacy along the wind; ripple detail
+normal fading by ~900 m; fog to the haze colour. Foam coverage should scale
+with the sea state (crest threshold from mean pinch) so `calm` shows almost
+none and `greybeards` is streaked white.
+
+### Demo workbench  (demo/)
+
+A page that proves the whole library and doubles as the tuning rig for the
+future games. Vite root is `demo/` (config exists at repo root). Import from
+`../src/index.js`.
+
+- Scene: gradient sky dome (small inline shader is fine), the ocean, and a
+  **placeholder hull** — a simple grey block hull with deck, a stub mast and
+  a flag so heading/roll read clearly. No detailed ship; that arrives from
+  another project.
+- The hull is driven by `Hull` + arrow keys / A-D for rudder, W/S for thrust.
+- Number keys 1–5 switch presets live (`setSeaState` on field + ocean;
+  `AirOverSea` refreshed). On-screen HUD (plain DOM): preset name, wind,
+  hull speed/heading, rudder-authority bar, broach-risk bar that flashes on
+  a broach or pooping, event log line.
+- `C` cycles cameras: orbit (drag to rotate, wheel to zoom), chase (astern),
+  and **helm** — eye-height on the quarterdeck looking aft over the stern at
+  the following sea. The helm view is the point of the whole exercise.
+- Three lighting presets on `L`: storm grey, sun break, dusk (values from the
+  reference game's moods are fine).
+- Runs with `npm run dev`. Keep it dependency-free beyond three.
+
+## Boundary
+
+Physics agent owns `src/*.js` and `test/`. Render agent owns `src/render/`
+and `demo/`. Neither edits the other's files; both read this contract. The
+render agent codes against the signatures above even if the physics files are
+not present yet.
