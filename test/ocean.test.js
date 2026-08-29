@@ -118,7 +118,9 @@ test('the field shader samples the field and takes the whitest answer', () => {
   const { fieldOnly } = fourWays();
   const src = fieldOnly.mesh.material.fragmentShader;
   assert.ok(src.includes('uniform sampler2D uFoamField;'));
-  assert.ok(src.includes('texture2D(uFoamField, ffUv).r * uFoamAmount * ffFade'));
+  // Squared, deliberately: a half-faded memory reads as lace, not half-paint.
+  assert.ok(src.includes('float ffScar = texture2D(uFoamField, ffUv).r;'));
+  assert.ok(src.includes('ffScar * ffScar * uFoamAmount * ffFade'));
   assert.ok(/crestFoam = max\(crestFoam,/.test(src), 'the field can take white away');
   // Anchored to the datum footprint, which is where the field evaluated it.
   assert.ok(src.includes('(vUndisp - uFoamOrigin) * uFoamInvExtent'));
