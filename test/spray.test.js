@@ -225,3 +225,180 @@ test('dispose empties the group', () => {
   spray.dispose();
   assert.equal(spray.object3d.children.length, 0);
 });
+
+// --- The deck pass ---------------------------------------------------------------
+//
+// Every spawn candidate the system tries is one `crestAt` query, so wrapping
+// `crestAt` gives the spawn distribution exactly — asked-for, before the sea has
+// had its say about whether there is any water there. That is the right thing
+// to measure: the corridor decides *where the system looks*, and the crest test
+// that follows is untouched, which is the whole claim being made.
+
+/** Histogram the horizontal range of every spawn candidate from the eye. */
+function spawnRanges(preset, altitude, frames = 600, options = {}) {
+  const sea = createSeaState({ preset });
+  const field = new WaveField(sea, 40000);
+  const eye = new Vector3(0, altitude, 0);
+  const inside = [0, 0];   // within 15 m, within 40 m
+  let total = 0;
+
+  const real = sea.crestAt.bind(sea);
+  sea.crestAt = (x, z, t) => {
+    const r = Math.hypot(x - eye.x, z - eye.z);
+    total++;
+    if (r < 15) inside[0]++;
+    if (r < 40) inside[1]++;
+    return real(x, z, t);
+  };
+
+  const spray = createSpray(field, { budget: POOL, seed: 4242, ...options });
+  for (let i = 0; i < frames; i++) {
+    field.advance(1 / 60);
+    spray.update(1 / 60, eye);
+  }
+  return { near: inside[0] / total, mid: inside[1] / total, total, spray };
+}
+
+test('a low eye in a strong wind is spawned around, not merely near', () => {
+  const deck = spawnRanges('storm', 6);
+  const aloft = spawnRanges('storm', 60);
+
+  // Both windows are centred on the eye, so some near candidates are expected
+  // either way. The corridor has to be an order of magnitude, not a nudge.
+  assert.ok(
+    deck.near > aloft.near * 3,
+    `deck ${(deck.near * 100).toFixed(1)}% within 15 m against ${(aloft.near * 100).toFixed(1)}% aloft`
+  );
+  assert.ok(deck.near > 0.06, `only ${(deck.near * 100).toFixed(1)}% of spawns are close aboard`);
+  assert.ok(deck.mid > aloft.mid * 2);
+});
+
+test('the corridor redistributes the budget and never inflates it', () => {
+  // The pools, the attempt rate and the thresholds are untouched, so the number
+  // of candidates tried and the number of particles alive must both be within
+  // the noise of a camera that is out of the corridor's reach entirely.
+  const deck = spawnRanges('greybeards', 6);
+  const aloft = spawnRanges('greybeards', 60);
+
+  const attempts = deck.total / aloft.total;
+  assert.ok(attempts > 0.9 && attempts < 1.1, `deck tried ${attempts.toFixed(2)}× the candidates`);
+
+  for (const cls of ['spume', 'droplets']) {
+    const ratio = deck.spray.stats[cls] / aloft.spray.stats[cls];
+    assert.ok(
+      ratio > 0.85 && ratio < 1.15,
+      `${cls}: ${deck.spray.stats[cls]} alive at the deck against ${aloft.spray.stats[cls]} aloft`
+    );
+  }
+});
+
+test('the pass fades out with height and is gone by the time a bird is flying', () => {
+  const near = [6, 12, 18, 30].map((alt) => spawnRanges('greybeards', alt, 300).near);
+  for (let i = 1; i < near.length; i++) {
+    assert.ok(
+      near[i] < near[i - 1],
+      `the corridor did not close with height: ${near.map((n) => n.toFixed(3))}`
+    );
+  }
+  // Two hundred metres up is the albatross game, and it must see none of this.
+  const bird = spawnRanges('greybeards', 200, 300).near;
+  assert.ok(bird < near[0] * 0.2, `a bird at 200 m still gets ${(bird * 100).toFixed(1)}% close spawns`);
+});
+
+test('a calm sea pays nothing for a corridor it would never fill', () => {
+  // The gate is the wind, not the swell: below Force 6 there is nothing to
+  // carry water past a face, however big the sea has got.
+  assert.equal(sprayProfile(createSeaState({ preset: 'calm' })).deckWind, 0);
+  assert.equal(sprayProfile(createSeaState({ preset: 'breeze' })).deckWind, 0);
+  assert.equal(sprayProfile(createSeaState({ preset: 'gale' })).deckWind, 1);
+  assert.equal(sprayProfile(createSeaState({ preset: 'storm' })).deckWind, 1);
+
+  // And with the gate shut the arithmetic is the arithmetic that shipped: the
+  // corridor draws no random number, so the whole stream is untouched.
+  const low = rig('breeze', { seed: 606 });
+  const eye = new Vector3(0, 4, 0);
+  run(low.field, low.spray, 240, 1 / 60, eye);
+
+  const high = rig('breeze', { seed: 606 });
+  run(high.field, high.spray, 240, 1 / 60, eye);
+
+  assert.deepEqual(buffers(low.spray), buffers(high.spray));
+});
+
+// --- Water in the face -----------------------------------------------------------
+
+test('thrown water that passes the eye is reported, at most once a second', () => {
+  const hits = [];
+  const { field, spray } = rig('greybeards', {
+    seed: 4242,
+    onCameraHit: (s) => hits.push({ t: field.time, s }),
+  });
+
+  const eye = new Vector3(0, 0, 0);
+  for (let i = 0; i < 3600; i++) {
+    field.advance(1 / 60);
+    // A helmsman's eye, riding the water rather than pinned above mean level.
+    eye.y = field.sea.roughHeightAt(0, 0, field.time) + 6;
+    spray.update(1 / 60, eye);
+  }
+
+  assert.ok(hits.length > 0, 'a minute in a survival sea and nothing hit the helm');
+  for (let i = 1; i < hits.length; i++) {
+    assert.ok(
+      hits[i].t - hits[i - 1].t >= 0.99,
+      `two face-fulls ${(hits[i].t - hits[i - 1].t).toFixed(2)} s apart`
+    );
+  }
+  for (const h of hits) {
+    assert.ok(h.s > 0 && h.s <= 1, `strength ${h.s} is not a strength`);
+    assert.ok(h.s >= 0.25, 'even a fleck is worth a quarter of a face-full');
+  }
+});
+
+test('the callback is deterministic, settable, and free when nobody listens', () => {
+  const seen = [[], []];
+  const rigs = [rig('greybeards', { seed: 31 }), rig('greybeards', { seed: 31 })];
+
+  // One takes it as an option's worth of callback after the fact, the other was
+  // given nothing and has it assigned — the two must not differ.
+  rigs[0].spray.onCameraHit = (s) => seen[0].push(s);
+  rigs[1].spray.onCameraHit = (s) => seen[1].push(s);
+
+  for (const [n, { field, spray }] of rigs.entries()) {
+    const eye = new Vector3(0, 0, 0);
+    for (let i = 0; i < 1800; i++) {
+      field.advance(1 / 60);
+      eye.y = field.sea.roughHeightAt(0, 0, field.time) + 6;
+      spray.update(1 / 60, eye);
+      // Take the ear away halfway through the second run and put it back: the
+      // particles must not care whether anyone was listening.
+      if (n === 1 && i === 900) spray.onCameraHit = null;
+      if (n === 1 && i === 901) spray.onCameraHit = (s) => seen[1].push(s);
+    }
+  }
+
+  assert.deepEqual(buffers(rigs[0].spray), buffers(rigs[1].spray),
+    'listening changed the water');
+  assert.ok(seen[0].length > 0);
+
+  // Anything that is not a function is nobody, and stepping must still be safe.
+  assert.doesNotThrow(() => {
+    rigs[0].spray.onCameraHit = 'not a function';
+    assert.equal(rigs[0].spray.onCameraHit, null);
+    rigs[0].field.advance(1 / 60);
+    rigs[0].spray.update(1 / 60, new Vector3(0, 6, 0));
+  });
+});
+
+test('an albatross at altitude is never rained on by its own spray', () => {
+  let hits = 0;
+  const { field, spray } = rig('greybeards', { onCameraHit: () => hits++ });
+
+  const eye = new Vector3(0, 0, 0);
+  for (let i = 0; i < 1800; i++) {
+    field.advance(1 / 60);
+    eye.y = field.sea.roughHeightAt(0, 0, field.time) + 200;
+    spray.update(1 / 60, eye);
+  }
+  assert.equal(hits, 0, 'a bird two hundred metres up was hit in the face');
+});

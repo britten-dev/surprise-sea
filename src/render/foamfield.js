@@ -268,7 +268,7 @@ export function createFoamField(waveField, options = {}) {
   const size = Math.max(16, Math.round(coarse ? o.size / 2 : o.size));
   const extent = Math.max(1, o.extent);
   const texel = extent / size;
-  const halfLife = Math.max(0.05, o.halfLife);
+  let halfLife = Math.max(0.05, o.halfLife);
   const maxStamps = Math.max(1, Math.round(o.maxStamps));
 
   let sea = waveField.sea;
@@ -589,6 +589,22 @@ export function createFoamField(waveField, options = {}) {
     /** Point the drift somewhere else. Meteorological: where it comes *from*. */
     setWindFromDeg(deg) {
       downwind(deg, windDir);
+    },
+
+    /**
+     * Change how long the water remembers. By day 8 s keeps the scars as
+     * lace rather than a whitewash; by night the bioluminescence squares the
+     * field before painting it, so the same buffer can safely hold a much
+     * longer memory — a glowing wake road that lasts half a minute — without
+     * the daylight trade-off that fixed 8 in the first place. Takes effect on
+     * the next update; the history already in the buffer is untouched.
+     */
+    setHalfLife(seconds) {
+      halfLife = Math.max(0.05, seconds);
+    },
+
+    get halfLife() {
+      return halfLife;
     },
 
     dispose() {

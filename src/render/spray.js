@@ -30,6 +30,20 @@
 // And the population is frame-rate independent: the game tried one spawn per
 // dead particle per frame, which quietly halved the spray on a thirty-hertz
 // machine.
+//
+// A third generalisation came later, and it came from standing at the helm
+// rather than flying over it. The spawn window is a disc a couple of hundred
+// metres across, and a disc that size puts almost nothing in the handful of
+// metres where a streak reads as *passing*: the spume lived politely out on the
+// water and nothing ever reached the eye. So when the eye is at deck height and
+// the wind is strong, a share of the same spawn budget is redirected into a
+// narrow corridor dead upwind of the camera — the deck pass. The water still
+// comes off breaking crests and off nothing else; it is simply *asked for*
+// where it will be seen. Nothing is added: the pools, the attempt rate and the
+// thresholds are untouched, and this is redistribution to the last particle.
+// The corridor closes smoothly as the eye climbs, because the same library
+// flies an albatross two hundred metres up, and it never opens at all on a sea
+// with no wind in it — a calm draws not one extra random number.
 
 import * as THREE from 'three';
 
@@ -71,6 +85,46 @@ const MAX_ATTEMPTS = 4;
  * pool anyway. The scan starts from a rotating cursor so no slot starves.
  */
 const SEARCH_SHARE = 0.75;
+
+/**
+ * The deck pass: the corridor of air dead upwind of a low eye.
+ *
+ * `share` is the fraction of that class's spawn attempts redirected into it.
+ * A fifth of the spume, because eight hundred streaks funnelled into one
+ * corridor would be a wall rather than weather; near a third of the droplets,
+ * because they are the sparse class and the only one that actually reaches the
+ * eye. `spread` is the corridor's half-width in metres and `near` how close
+ * upwind a particle may be born — far enough out that nothing is ever born
+ * inside the near plane, close enough that it is past in a heartbeat.
+ *
+ * `flight` is not a distance but a fraction of one: the class's own speed over
+ * the ground times the share of its life the corridor should cover. Most of it,
+ * not all — a corridor as long as the whole flight delivers its first arrivals
+ * and then goes quiet, and one much shorter fires a volley rather than a stream.
+ */
+const DECK = {
+  spume: { share: 0.22, spread: 6, near: 5, flight: 1.15 * 1.8 },
+  droplets: { share: 0.3, spread: 5, near: 4, flight: 1.05 * 1.15 },
+};
+
+/** Deck height, and the altitude by which the pass has faded out entirely. */
+const DECK_EYE = { low: 10, high: 20 };
+
+/**
+ * Force 6 to Force 8. Below that the sea may still be big — a dying swell is
+ * enormous and perfectly quiet — but there is no wind in it to carry water past
+ * anybody's face, and the corridor would only crowd the spume it already has.
+ */
+const DECK_WIND = { off: 12, full: 18 };
+
+/** Arm's length. A droplet inside this has hit the man at the wheel. */
+const HIT_RADIUS = 2.5;
+
+/** And it may say so no more than once a second, however wet it gets. */
+const HIT_COOLDOWN = 1;
+
+/** Droplets inside arm's length in one frame that make a face-full. */
+const HIT_FULL = 5;
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
@@ -129,6 +183,27 @@ function spawnPoint(rand, cx, cz, range, windUnit, crowd, minR, lead, out = _spa
   const rad = minR + (range - minR) * Math.pow(rand(), crowd);
   out.x = cx + Math.cos(ang) * rad - windUnit.x * lead;
   out.z = cz + Math.sin(ang) * rad - windUnit.z * lead;
+  return out;
+}
+
+/**
+ * A birth in the deck corridor: dead upwind of the eye, within a few metres of
+ * the line the wind is about to carry it along.
+ *
+ * The lateral offset is squared about the middle rather than even, so most of
+ * what is born here goes by close enough to streak across the view and only the
+ * tail of the distribution passes out on the beam. Everything else about the
+ * birth is unchanged — the crest test that follows is the same test — so this
+ * asks for water where it will be seen and never invents any.
+ */
+function deckPoint(rand, cx, cz, windUnit, reach, spread, near, out = _spawn) {
+  const up = near + rand() * Math.max(reach - near, 1);
+  const u = rand() * 2 - 1;
+  const side = u * Math.abs(u) * spread;
+  // Upwind is minus the downwind unit; across it is that vector turned a quarter
+  // turn in the xz plane.
+  out.x = cx - windUnit.x * up - windUnit.z * side;
+  out.z = cz - windUnit.z * up + windUnit.x * side;
   return out;
 }
 
@@ -207,6 +282,9 @@ export function sprayProfile(sea) {
     windSpeed: sea?.windSpeed ?? 0,
     // Sheets start at Force 9 and are the whole sky by Force 11.
     sheetChance: clamp(((sea?.windSpeed ?? 0) - SHEET_WIND) / 12, 0, 1),
+    // And the deck pass starts at Force 6. Nought here is the gate that keeps a
+    // calm sea paying nothing at all for a corridor it would never fill.
+    deckWind: smoothstep(DECK_WIND.off, DECK_WIND.full, sea?.windSpeed ?? 0),
   };
 }
 
@@ -440,6 +518,12 @@ function createSpume(count, seed) {
     const travel = c.windSpeed * 1.15 * 2.7;
     const range = c.range * 220;
     const scale = profile.scale;
+    // The share of this frame's attempts that go into the corridor instead of
+    // out on to the water, and how far up it they may be born. The floor on the
+    // reach is for a wind that has dropped away under a sea still running: the
+    // corridor must not collapse into a single point on the taffrail.
+    const deck = c.deck * DECK.spume.share;
+    const reach = Math.max(DECK.spume.near + 8, c.windSpeed * DECK.spume.flight);
     let alive = 0;
     let searches = 0;
 
@@ -456,7 +540,15 @@ function createSpume(count, seed) {
         // off white water and off nothing else.
         for (let a = 0; a < c.attempts; a++) {
           if (gate < 1 && rand() > gate) continue;
-          const { x, z } = spawnPoint(rand, c.cx, c.cz, range, c.windUnit, 1.2, 4, travel * 0.5);
+          // The draw is only made when the corridor is open — short-circuited,
+          // and deliberately so. A calm sea, or a camera at altitude, takes the
+          // same arithmetic and the very same stream of random numbers it took
+          // before any of this was written.
+          const { x, z } =
+            deck > 0 && rand() < deck
+              ? deckPoint(rand, c.cx, c.cz, c.windUnit, reach,
+                          DECK.spume.spread, DECK.spume.near)
+              : spawnPoint(rand, c.cx, c.cz, range, c.windUnit, 1.2, 4, travel * 0.5);
           if (sea.crestAt(x, z, t) < profile.spumeThreshold) continue;
 
           positions[o] = x;
@@ -570,6 +662,11 @@ function createDroplets(count, seed) {
     const travel = c.windSpeed * 1.05 * 1.65;
     const range = c.range * 200;
     const scale = profile.scale;
+    const deck = c.deck * DECK.droplets.share;
+    const reach = Math.max(DECK.droplets.near + 6, c.windSpeed * DECK.droplets.flight);
+    // Arm's length, squared, so the hot loop compares two squares. Only counted
+    // when somebody is listening and the last face-full is a second behind us.
+    const hitR2 = c.wantHits ? HIT_RADIUS * HIT_RADIUS : -1;
     let alive = 0;
     let searches = 0;
 
@@ -584,7 +681,11 @@ function createDroplets(count, seed) {
 
         for (let a = 0; a < c.attempts; a++) {
           if (gate < 1 && rand() > gate) continue;
-          const { x, z } = spawnPoint(rand, c.cx, c.cz, range, c.windUnit, 1.4, 6, travel * 0.5);
+          const { x, z } =
+            deck > 0 && rand() < deck
+              ? deckPoint(rand, c.cx, c.cz, c.windUnit, reach,
+                          DECK.droplets.spread, DECK.droplets.near)
+              : spawnPoint(rand, c.cx, c.cz, range, c.windUnit, 1.4, 6, travel * 0.5);
           const pinch = sea.crestAt(x, z, t);
           if (pinch < profile.dropletThreshold) continue;
 
@@ -624,6 +725,22 @@ function createDroplets(count, seed) {
       positions[o] += velocities[o] * dt;
       positions[o + 1] += velocities[o + 1] * dt;
       positions[o + 2] += velocities[o + 2] * dt;
+
+      // Did it hit him? Measured against the eye position this very update was
+      // handed, so the answer is about where the camera *is* and not where it
+      // was last frame. The count and the nearest miss both go back to the
+      // caller, because one fleck at arm's length and five across the face are
+      // not the same event.
+      if (hitR2 > 0) {
+        const hx = positions[o] - c.cx;
+        const hy = positions[o + 1] - c.cy;
+        const hz = positions[o + 2] - c.cz;
+        const d2 = hx * hx + hy * hy + hz * hz;
+        if (d2 < hitR2) {
+          c.hits++;
+          if (d2 < c.hitNearest) c.hitNearest = d2;
+        }
+      }
 
       // Back into the sea. Given a moment first, so a droplet born a hand's
       // breadth above a crest is not killed by the crest it came off.
@@ -834,9 +951,14 @@ const DEFAULT_LIGHTING = {
  *   `lighting`   the same object `createOcean` takes; only `water.foam`,
  *                `sunColour`, `skyHaze` and `glare` are read.
  *   `pixelRatio` defaults to the device's, capped at two.
+ *   `onCameraHit` called with a strength 0..1 when thrown water passes within
+ *                arm's length of the eye. At most once a second, and only where
+ *                the deck pass is live — from altitude, or in a wind that
+ *                carries nothing, no droplet was ever going to arrive. Also
+ *                settable afterwards, the way `Hull` takes its events.
  *
  * @returns `{ object3d, update(dt, cameraPos), setSeaState, setLighting,
- *            dispose, stats }`
+ *            onCameraHit, dispose, stats }`
  */
 export function createSpray(waveField, options = {}) {
   // A coarse pointer is a phone. Guarded, because this module is imported by
@@ -940,9 +1062,22 @@ export function createSpray(waveField, options = {}) {
   // rounding: the population must not depend on how fast the machine is.
   let attemptCarry = 0;
 
+  // Who to tell when the sea comes aboard, and how long until it may be said
+  // again. A gale throws water past the eye continuously; an event reported
+  // continuously is not an event, so it is reported at most once a second.
+  let onCameraHit = typeof options.onCameraHit === 'function' ? options.onCameraHit : null;
+  let hitCooldown = 0;
+
   return {
     object3d,
     stats,
+
+    get onCameraHit() {
+      return onCameraHit;
+    },
+    set onCameraHit(fn) {
+      onCameraHit = typeof fn === 'function' ? fn : null;
+    },
     uniforms: {
       spume: spume.uniforms,
       droplets: droplets.uniforms,
@@ -986,14 +1121,41 @@ export function createSpray(waveField, options = {}) {
       const attempts = Math.floor(attemptCarry);
       attemptCarry -= attempts;
 
+      // The deck pass. Full at the height of a man on a quarterdeck, gone by
+      // the time a bird has climbed clear of the troughs, and shut outright on
+      // any sea without the wind to carry water. The two gates multiply, so it
+      // opens and closes smoothly on both.
+      const deck =
+        profile.deckWind > 0
+          ? (1 - smoothstep(DECK_EYE.low, DECK_EYE.high, altitude)) * profile.deckWind
+          : 0;
+
+      // Nobody listening, or the last face-full is less than a second behind
+      // us, or there is no pass to be hit by: the distance test is not worth
+      // the cycles.
+      hitCooldown = Math.max(0, hitCooldown - dt);
+      const wantHits = !!onCameraHit && hitCooldown <= 0 && deck > 0;
+
       const ctx = {
-        dt, sea, t, wind, profile, cx, cz, altitude, range, attempts,
-        windSpeed, windUnit,
+        dt, sea, t, wind, profile, cx, cy, cz, altitude, range, attempts,
+        windSpeed, windUnit, deck,
+        wantHits, hits: 0, hitNearest: Infinity,
       };
 
       stats.spume = spume.update(ctx);
       stats.droplets = droplets.update(ctx);
       stats.sheets = sheets.update(ctx);
+
+      if (wantHits && ctx.hits > 0) {
+        // How wet, in one number: how close the nearest of them came, and how
+        // many came with it. A single fleck out at arm's length is a quarter of
+        // what a crest breaking over the taffrail throws at a man.
+        const closeness = 1 - Math.sqrt(ctx.hitNearest) / HIT_RADIUS;
+        const weight = clamp(ctx.hits / HIT_FULL, 0, 1);
+        hitCooldown = HIT_COOLDOWN;
+        onCameraHit(clamp(0.25 + 0.45 * closeness + 0.5 * weight, 0, 1));
+      }
+
       return stats;
     },
 

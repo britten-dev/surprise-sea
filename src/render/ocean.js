@@ -12,10 +12,27 @@
 // because storm light has more range than a display does and the alternative is
 // a sea of white crests with nothing inside them.
 //
+// One term in there is not reflected light at all. Under a dark enough sky the
+// churned water lights itself: sea fire, keyed off the scar field, so a wake is
+// a green trail that outlives the white it was made of. It is gated on a
+// uniform that a lit sky drives to nought, and a daylight sea therefore pays a
+// comparison for it and nothing else.
+//
 // Close in it reaches back for the wave table and re-evaluates the analytic
 // normal per pixel. That is not extra detail invented for the eye — it is the
 // sum the CPU already walks, sampled where a metres-wide grid cell was
 // interpolating the crest edges away.
+//
+// Closer still — inside a hundred metres, which from the helm is everything
+// between the taffrail and the next sea — three things happen that are for the
+// eye alone, all of them switched by the same `normalRange` that governs the
+// per-pixel normal, and all of them described in render/detail.js: a second
+// wave table of half-metre-to-ten-metre wavelets travelling at their own
+// speeds, capped at fifteen centimetres in total; lace and a harder edge in the
+// near foam; and shadow on the leading face under a crest at the top of its
+// pinch. The first is the review's sub-30cm carve-out spent deliberately; the
+// third is its sanctioned fake for a breaking lip, which must never be built
+// out of geometry the physics cannot see.
 //
 // Two things are decoupled from the game this was ported out of. Lighting is a
 // plain object handed in and swappable — no mood system, no config import — and
@@ -27,6 +44,13 @@
 import * as THREE from 'three';
 import { waveUniforms, oceanVertexChunk, oceanNormalChunk } from '../seastate.js';
 import { warpedGrid } from './grid.js';
+import {
+  DETAIL_COUNT,
+  detailTable,
+  detailUniforms,
+  detailVertexChunk,
+  detailNormalChunk,
+} from './detail.js';
 
 // The look of the shipped storm, and the shape every lighting object takes.
 const DEFAULT_LIGHTING = {
@@ -39,8 +63,20 @@ const DEFAULT_LIGHTING = {
   // Stops in front of the tone map. Storm light is the reference at 1; a sun
   // break wants a little more and dusk a little less.
   exposure: 1,
-  water: { deep: 0x25383c, crest: 0x3d6a5c, foam: 0xdfe4e4 },
+  // How much sea fire is in the water, 0..1. Nought is every daylight preset
+  // there will ever be; one is a moonless night over a bloom.
+  bioluminescence: 0,
+  water: { deep: 0x25383c, crest: 0x3d6a5c, foam: 0xdfe4e4, glow: 0x2fd6a8 },
 };
+
+// The band of sky brightness over which sea fire is put out, measured as the
+// luminance of the haze colour in linear light. Below the first number the sky
+// is dark enough to see a bloom by; above the second there is daylight on the
+// water and there is nothing to see, however hard the water is glowing. Storm
+// grey sits at 0.40 and dusk at 0.23, so both are well clear of it: a preset
+// has to be night before the term can turn on at all.
+const GLOW_SKY_LO = 0.02;
+const GLOW_SKY_HI = 0.18;
 
 // `normalRange` is how far out the fragment stage re-evaluates the analytic
 // normal per pixel, in metres. Nought turns it off outright — the wave table
@@ -56,10 +92,11 @@ const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
  * the last of these is what the foam noise is anchored to, because sampling
  * noise at the *displaced* position would make the lace crawl with the orbit.
  */
-const vertexShader = (waveCount) => /* glsl */ `
+const vertexShader = (waveCount, detailCount) => /* glsl */ `
   ${oceanVertexChunk(waveCount)}
-
+${detailCount > 0 ? detailVertexChunk(detailCount) : ''}
   uniform vec3 uCameraPos;
+${detailCount > 0 ? '  uniform float uDetail;' : ''}
 
   varying vec3 vNormal;
   varying vec3 vWorldPos;
@@ -76,7 +113,15 @@ const vertexShader = (waveCount) => /* glsl */ `
     vec3 n;
     float crest;
     vec3 displaced = gerstner(p, camDist, n, crest);
-
+${detailCount > 0 ? `
+    // And the wavelets on top of it, near the camera only, and never more than
+    // fifteen centimetres of them all told. The crest the fragment stage keys
+    // its foam off is left exactly as the spectrum reported it: this layer is
+    // texture, and it has no business deciding where the sea breaks.
+    vec3 chopSlope;
+    displaced += detailDisplace(p, camDist, uTime, chopSlope) * uDetail;
+    n = normalize(n + chopSlope * uDetail);
+` : ''}
     vNormal = n;
     vWorldPos = displaced;
     vCrest = crest;
@@ -173,8 +218,9 @@ export const agxToneMapChunk = /* glsl */ `
  * reason: a phone with no foam field is running the shader it ran before either
  * of them existed, down to the uniform declarations.
  */
-const fragmentShader = (waveCount, normalRange, features = {}) => /* glsl */ `
+const fragmentShader = (waveCount, normalRange, detailCount, features = {}) => /* glsl */ `
   ${normalRange > 0 ? oceanNormalChunk(waveCount) : ''}
+  ${detailCount > 0 ? detailNormalChunk(detailCount) : ''}
   ${skyGradientChunk}
   ${agxToneMapChunk}
 
@@ -202,6 +248,9 @@ const fragmentShader = (waveCount, normalRange, features = {}) => /* glsl */ `
   uniform float uFoamScale;    // foam texture frequency, from the dominant wave
   uniform float uRipple;       // strength of the wind-texture normal
   uniform float uExposure;     // stops in front of the tone map
+  uniform vec3 uGlow;          // sea fire: the colour churned water burns
+  uniform float uGlowAmount;   // 0..1, already put out by whatever sky is up
+${detailCount > 0 ? '  uniform float uDetail;       // 0 turns the near-field treatment off' : ''}
 ${features.foamField ? `
   // The scar field: one channel of accumulated white water, world-anchored on a
   // footprint that follows the camera. See render/foamfield.js.
@@ -232,6 +281,12 @@ ${features.foamField ? `
   float fbm(vec2 p) {
     return noise(p) * 0.65 + noise(p * 2.7) * 0.35;
   }
+${detailCount > 0 ? `  // The same octave folded about its own middle, which turns blobs into veins
+  // for the price of an abs(). Foam close to does not lie on the water in
+  // patches: it lies in lace, thick along the folds and thin between them.
+  float veins(vec2 p) {
+    return 1.0 - abs(noise(p) * 2.0 - 1.0);
+  }` : ''}
 
   void main() {
     vec3 viewDir = normalize(uCameraPos - vWorldPos);
@@ -252,7 +307,12 @@ ${normalRange > 0 ? `
     if (nearAmt > 0.002) {
       // Horizontal range, to match the attenuation the vertex stage applied.
       float camDistF = distance(vUndisp, uCameraPos.xz);
-      vec3 nf = gerstnerNormal(vUndisp, camDistF, uTime);
+      vec3 nf = gerstnerNormal(vUndisp, camDistF, uTime);${detailCount > 0 ? `
+      // The wavelets, where a pixel can hold one. The same sum the vertex
+      // stage displaced by, evaluated at the same datum footprint — but carried
+      // an order of magnitude further out, because a pixel resolves half a
+      // metre of chop at twenty metres and a vertex resolves it nowhere.
+      nf = normalize(nf + detailSlope(vUndisp, camDistF, uTime) * uDetail);` : ''}
       n = normalize(mix(vNormal, nf, nearAmt));
     }
 ` : ''}
@@ -262,8 +322,12 @@ ${normalRange > 0 ? `
     // resolve, not about how big the sea is. Where the per-pixel normal is
     // running it is turned down to what it is honestly for — micro-detail
     // below the shortest wave in the table — rather than standing in for the
-    // definition the vertex normal was losing.
-    float rippleAmt = uRipple * exp(-dist / 900.0) * (1.0 - 0.55 * nearAmt);
+    // definition the vertex normal was losing. Where the wavelet table is
+    // running as well it is turned down further still: the noise and the
+    // wavelets are both standing in for the same missing octaves, and the point
+    // of building the wavelets was to *replace* fakery rather than add to it.
+    float rippleAmt = uRipple * exp(-dist / 900.0)
+                    * (1.0 - ${detailCount > 0 ? '(0.55 + 0.30 * uDetail)' : '0.55'} * nearAmt);
     if (rippleAmt > 0.01) {
       vec2 rp = vUndisp * 0.31 + uWindDir * uTime * -1.4;
       float e = 0.9;
@@ -303,6 +367,37 @@ ${normalRange > 0 ? `
     float lean = smoothstep(0.0, 0.45, 1.0 - n.y);
     float sss = lobe * lifted * (0.35 + 0.65 * thin) * (0.5 + 0.5 * lean);
     water += uCrestGlow * (sss * (1.4 + uGlare * 2.6));
+${detailCount > 0 ? `
+    // Under the fold. A crest at the top of its pinch is already thickening
+    // toward throwing its lip forward, and the face beneath one goes into its
+    // shadow long before there is anything an oceanographer would call a
+    // breaker. Showing that with geometry would put water where heightAt says
+    // there is none, in the exact twenty metres where a hull and a wingtip
+    // live, so the water darkens instead — the review's sanctioned fake, and
+    // the only honest way to buy the mass of an overturning face.
+    //
+    // Two things have to be true together, which is what keeps it from reading
+    // as a painted stripe. The pinch has come up to where this sea breaks —
+    // measured off the foam thresholds, so it means the same in a gale as in a
+    // survival storm, and starting a little below foamLo so the shade is
+    // already there under the white rather than arriving with it. And it is the
+    // *leading* face: on a wave running downwind the normal ahead of the crest
+    // tilts downwind too, which picks out the side that overturns and nothing
+    // else — the back of the crest and the apex itself both fall to nought
+    // without a second term. The shape normal is the right one to ask, not the
+    // detailed one: this is about which face of a wave a pixel is on, and the
+    // wavelets have no opinion worth having about that.
+    float pinchBand = max(uFoamHi - uFoamLo, 1e-4);
+    float underFold = smoothstep(uFoamLo - 0.35 * pinchBand, uFoamLo + 0.55 * pinchBand, vCrest)
+                    * clamp(dot(vNormal.xz, uWindDir) * 3.5, 0.0, 1.0)
+                    * (1.0 - smoothstep(45.0, 190.0, dist))
+                    * uDetail;
+    water = mix(water, uDeep * 0.34, 0.62 * underFold);
+
+    // And less sky in it: a face in the shadow of its own crest is looking up
+    // at the water above it rather than out at the horizon.
+    fresnel *= 1.0 - 0.4 * underFold;
+` : ''}
 
     // Reflected sky — the same two-ramp gradient the dome overhead is drawn
     // with, evaluated along the reflected ray, so the sea mirrors the sky that
@@ -354,6 +449,27 @@ ${features.reflection ? `
     // water, not as half a coat of paint. Fresh white is still fresh white.
     float ffScar = texture2D(uFoamField, ffUv).r;
     crestFoam = max(crestFoam, ffScar * ffScar * uFoamAmount * ffFade);` : ''}
+${detailCount > 0 ? `
+    // Close in, break the wash into lace. Two octaves of ridged noise at about
+    // a metre and a third of a metre, drifting downwind with everything else,
+    // and living in the mid tones only: fresh white stays white, bare water
+    // stays bare, and what gains structure is the half-broken water between
+    // them — which at ten metres is most of what there is to look at.
+    float laceAmt = (1.0 - smoothstep(40.0, 165.0, dist)) * uDetail;
+    if (laceAmt > 0.004) {
+      vec2 lp = vUndisp * 0.95 * uFoamScale + uWindDir * uTime * -0.7;
+      float lacework = veins(lp) * 0.62 + veins(lp * 2.6 + 11.3) * 0.38;
+      float mids = 4.0 * crestFoam * (1.0 - crestFoam);
+      // The pivot is the ridged noise's own mean, so the lace neither adds
+      // white nor takes it away on balance: it moves white about inside a
+      // patch, which is what lace is, rather than eating holes in one.
+      crestFoam = clamp(crestFoam + (lacework - 0.62) * mids * laceAmt * 0.85, 0.0, 1.0);
+      // And a harder edge than the far field wants. The soft threshold that
+      // stops a crest half a mile off from becoming a white bar is the wrong
+      // answer twenty metres astern, where broken water has a rim to it.
+      crestFoam = mix(crestFoam, smoothstep(0.12, 0.72, crestFoam), laceAmt * 0.6);
+    }
+` : ''}
     crestFoam *= 0.22 + 0.78 * exp(-dist / 5500.0);
 
     // Spindrift: old foam drawn out downwind in long lace streaks — narrow
@@ -372,6 +488,48 @@ ${features.reflection ? `
     float lam = max(0.0, dot(n, sun));
     vec3 foamCol = uFoam * (0.55 + 0.45 * lam) + uSunColour * lam * 0.12 * uGlare;
     col = mix(col, foamCol, foam);
+
+    // --- Sea fire -------------------------------------------------------------
+    // Bioluminescence, which is the one thing in this shader the sky is not
+    // responsible for: the water is not being lit, it is alight. Dinoflagellates
+    // fire where the water around them is sheared, so the mask is the same broken
+    // water the foam is painted on — and the half of it worth having is the half
+    // the sea remembers. A hull carves a lane into the scar field, the field
+    // holds it while it decays, and the lane goes on burning green long after it
+    // has stopped showing white: at night the foam colour is a dim grey that is
+    // lost against a black sea almost at once, and the fire is not.
+    //
+    // Added as light, before the fog and before the tone map. Before the fog
+    // because it is emitted at the surface and distance is entitled to take it
+    // like anything else; before the tone map because AgX is what keeps the
+    // brightest of it rolling off toward white instead of standing on the
+    // display's ceiling as a neon line.
+    //
+    // Both terms go in squared, and that is the difference between a sea and a
+    // green bedsheet. The same tone curve that rescues storm highlights lifts the
+    // bottom of the range enormously — a hundredth of scene light comes back as a
+    // quarter of the display — so a mask running linearly from a tenth to one
+    // arrives at the eye running from two thirds to one, with every wave in it
+    // flattened out. Measured in a survival sea, the field's ambient wash is
+    // about a tenth and a fresh wake is six times that: squaring is what turns
+    // those into a whisper of green under a bright road. It is not only a fix for
+    // the curve, either — the fire goes as the water that was actually sheared,
+    // and a patch half covered in broken water has nothing like half of it.
+    if (uGlowAmount > 0.0) {
+      // This instant's breaking crest, at a third the gain: a wave going over
+      // now burns, but it is nothing beside the acre of sea it tore a minute
+      // ago. Distance-faded already, along with the foam it is measured from.
+      float churn = 0.34 * crestFoam * crestFoam;${features.foamField ? `
+      // And the memory, at full gain: the same sample the foam took, with the
+      // same fade at the edge of the footprint and the same say in how far the
+      // field is believed at all. The white water and the fire fade together
+      // from here, but they do not fade to the same place — a dim grey foam
+      // colour is lost against a black sea long before a green one is — so a
+      // lane goes on burning after it has stopped showing white.
+      float scar = ffScar * ffFade * uFoamAmount;
+      churn = max(churn, scar * scar);` : ''}
+      col += uGlow * (churn * 1.2 * uGlowAmount);
+    }
 
     // --- Air ----------------------------------------------------------------
     float f = dist * uFogDensity;
@@ -438,6 +596,29 @@ export function foamProfile(sea) {
   };
 }
 
+/**
+ * How much sea fire actually reaches the water.
+ *
+ * Bioluminescence is not faint — a bloom under a bow wave is bright enough to
+ * read a chart by — but it is hopelessly outmatched by any sky at all, which is
+ * why nobody has seen it from a ferry deck at four in the afternoon. So the
+ * lighting's `bioluminescence` is what the sea *has* in it, and this is how much
+ * of that survives the sky overhead: the haze colour is the light on the
+ * horizon, and once there is a useful amount of it the fire is gone.
+ *
+ * Done here, on the CPU, once per change of light, rather than in the shader
+ * where it would be recomputed a million times a frame to arrive at the same
+ * answer. The luminance is of the colour as the shader has it — linear light,
+ * not the sRGB the hex was written in — because that is what the eye is being
+ * asked about.
+ */
+function glowAmount(bioluminescence, haze) {
+  const luma = haze.r * 0.2126 + haze.g * 0.7152 + haze.b * 0.0722;
+  const t = clamp((luma - GLOW_SKY_LO) / (GLOW_SKY_HI - GLOW_SKY_LO), 0, 1);
+  const dark = 1 - t * t * (3 - 2 * t);
+  return clamp(bioluminescence ?? 0, 0, 1) * dark;
+}
+
 /** Direction the wind blows *toward*, as a unit vector on the xz plane. */
 function downwind(windFromDeg, out = new THREE.Vector2()) {
   const rad = THREE.MathUtils.degToRad(windFromDeg);
@@ -457,12 +638,18 @@ function setColour(uniform, value) {
  * @param waveField  a WaveField; its `sea` supplies the spectrum and its `time`
  *                   the clock, so the mesh can never drift out of step with the
  *                   physics reading the same field.
- * @param options    { quality, windFromDeg, fogDensity, lighting, foamField }
- *                   quality: { gridN, halfSpan, exponent, normalRange }
+ * @param options    { quality, windFromDeg, fogDensity, lighting, foamField,
+ *                     detail }
+ *                   quality: { gridN, halfSpan, exponent, normalRange } —
+ *                            normalRange also governs the near-field wavelets;
+ *                            nought compiles both out.
  *                   lighting: { sunDir, sunColour, skyTop, skyHaze, glare,
- *                               fogDensity, exposure, water }
+ *                               fogDensity, exposure, bioluminescence, water }
+ *                             — water is { deep, crest, foam, glow }, the last
+ *                               of them the colour of the sea fire.
  *                   foamField: a createFoamField, or nothing at all — see
  *                              `setFoamField` below.
+ *                   detail: 0..1, the starting value of `setDetail`.
  */
 export function createOcean(waveField, options = {}) {
   const quality = { ...DEFAULT_QUALITY, ...(options.quality ?? {}) };
@@ -501,6 +688,17 @@ export function createOcean(waveField, options = {}) {
     uFoamScale: { value: 1 },
     uRipple: { value: 0.3 },
     uExposure: { value: 1 },
+    // Sea fire. The amount is the gate: at nought the term is a comparison that
+    // fails, which is why it is a uniform and not a compile flag — a game may
+    // sail from dusk into darkness and the sea must not stop to be rebuilt.
+    uGlow: { value: new THREE.Color() },
+    uGlowAmount: { value: 0 },
+    // How much of the near-field treatment is in force. One is the shipped
+    // look; nought is the sea exactly as it was before render/detail.js
+    // existed, wavelets, lace, fold-shadow and all, which is what makes it
+    // possible to judge the three of them against the water they replaced
+    // rather than against a memory of it.
+    uDetail: { value: clamp(options.detail ?? 1, 0, 1) },
     // Only ever read by a material that has the reflection compiled into it;
     // kept here always so `setReflection` has somewhere to put its answer.
     uSkyRefl: { value: null },
@@ -510,6 +708,18 @@ export function createOcean(waveField, options = {}) {
   // Nought disables the near-field normal pass; anything else is a range in
   // metres, and the shader is generated around it.
   const normalRange = Math.max(0, quality.normalRange ?? 0);
+
+  // The wavelet table rides on the same switch, and for the same reason: it is
+  // a second wave loop in both stages, and a machine that cannot afford the
+  // first one per pixel certainly cannot afford this. Nought compiles every
+  // line of render/detail.js out of both shaders — no arrays, no loop, no
+  // uniform declared — and what is left is the phone path unchanged.
+  const detailCount = normalRange > 0 ? DETAIL_COUNT : 0;
+
+  // Built either way — it is a dozen sines' worth of arithmetic and a caller
+  // may want to read the budget back — but only uploaded where it is compiled.
+  let detail = detailTable(sea);
+  if (detailCount > 0) Object.assign(uniforms, detailUniforms(detail));
 
   // The two optional layers. Both are compiled in rather than switched at
   // runtime, so an ocean with neither is byte for byte the shader it was before
@@ -533,8 +743,8 @@ export function createOcean(waveField, options = {}) {
 
   const makeMaterial = () =>
     new THREE.ShaderMaterial({
-      vertexShader: vertexShader(waveCount),
-      fragmentShader: fragmentShader(waveCount, normalRange, {
+      vertexShader: vertexShader(waveCount, detailCount),
+      fragmentShader: fragmentShader(waveCount, normalRange, detailCount, {
         foamField: foamField !== null,
         reflection: reflection !== null,
       }),
@@ -566,6 +776,17 @@ export function createOcean(waveField, options = {}) {
     uniforms.uRipple.value = p.ripple;
   }
 
+  /** Re-roll the wavelets for the sea now in force. The count never changes, so
+   *  this is a re-upload into the same arrays and never a recompile — and the
+   *  table is deterministic in the sea state, so a preset swapped away and back
+   *  comes back with the chop it had. */
+  function applyDetail() {
+    detail = detailTable(sea);
+    if (detailCount === 0) return;
+    const fresh = detailUniforms(detail);
+    for (const key of Object.keys(fresh)) uniforms[key].value = fresh[key].value;
+  }
+
   // The lighting actually in force, so a caller may hand over half an object —
   // "just the glare" — without the rest of the sky going black.
   let lighting = { ...DEFAULT_LIGHTING, water: { ...DEFAULT_LIGHTING.water } };
@@ -587,6 +808,10 @@ export function createOcean(waveField, options = {}) {
     uniforms.uGlare.value = lighting.glare ?? 0.4;
     uniforms.uFogDensity.value = baseFog * (lighting.fogDensity ?? 1);
     uniforms.uExposure.value = lighting.exposure ?? 1;
+
+    // After the haze, which the gate is computed from.
+    setColour(uniforms.uGlow, lighting.water.glow);
+    uniforms.uGlowAmount.value = glowAmount(lighting.bioluminescence, uniforms.uSkyHaze.value);
   }
 
   /** Swap the material for one generated around the flags as they now stand.
@@ -604,6 +829,12 @@ export function createOcean(waveField, options = {}) {
     mesh,
     uniforms,
 
+    /** The wavelet table in force, budget and all. Read-only, and mostly read
+     *  by the tests that hold this file to the fifteen-centimetre law. */
+    get detail() {
+      return detail;
+    },
+
     update(cameraPos) {
       // The mesh's clock *is* the wave field's clock. One sea.
       uniforms.uTime.value = waveField.time;
@@ -613,6 +844,21 @@ export function createOcean(waveField, options = {}) {
     },
 
     setLighting,
+
+    /**
+     * How much of the near-field treatment to run, 0..1.
+     *
+     * One dial for all three of the things render/detail.js brought: the
+     * wavelets, the foam lace and the shadow under a fold. Nought is the sea as
+     * it was before any of them, which is what it is for — put it on a key in a
+     * workbench and the eye can be asked the only question that matters, which
+     * is whether the water is better with them than without. It is a uniform,
+     * not a recompile, so it can be animated; to be rid of the cost as well as
+     * the look, build with `quality.normalRange` at nought.
+     */
+    setDetail(amount) {
+      uniforms.uDetail.value = clamp(amount ?? 1, 0, 1);
+    },
 
     /**
      * Give the sea a memory, or take it away again.
@@ -677,6 +923,7 @@ export function createOcean(waveField, options = {}) {
       }
 
       applyFoam();
+      applyDetail();
     },
 
     dispose() {

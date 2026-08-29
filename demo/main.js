@@ -23,6 +23,7 @@ import * as THREE from 'three';
 // down with it.
 import { createSky } from '../src/render/sky.js';
 import { createRain } from '../src/render/rain.js';
+import { createLens } from '../src/render/lens.js';
 
 // --- Settings ----------------------------------------------------------------
 
@@ -43,10 +44,11 @@ const SHIP = {
   eye: 1.65,        // a helmsman's eye above whatever he is standing on
 };
 
-// Three ways to light the same sea, lifted from the reference game's Southern
-// Ocean moods. `sunIntensity` and `ambient` are for the scene lights the block
-// hull needs; createOcean reads only the keys it knows. All three are dry —
-// rain is weather rather than light, and it is the panel's to add.
+// Four ways to light the same sea: three lifted from the reference game's
+// Southern Ocean moods, and the night the review asked for. `sunIntensity` and
+// `ambient` are for the scene lights the block hull needs; createOcean reads
+// only the keys it knows. All four are dry — rain is weather rather than light,
+// and it is the panel's to add — and only the last has any fire in the water.
 const LIGHTS = [
   {
     label: 'Storm grey',
@@ -60,6 +62,7 @@ const LIGHTS = [
     glare: 0.3,
     exposure: 1.0,
     rain: 0,
+    bioluminescence: 0,
     water: { deep: 0x25383c, crest: 0x3d6a5c, foam: 0xdfe4e4 },
   },
   {
@@ -74,6 +77,7 @@ const LIGHTS = [
     glare: 0.95,
     exposure: 1.15,
     rain: 0,
+    bioluminescence: 0,
     water: { deep: 0x2a3f41, crest: 0x518063, foam: 0xe8e9e2 },
   },
   {
@@ -88,7 +92,40 @@ const LIGHTS = [
     glare: 0.55,
     exposure: 0.85,
     rain: 0,
+    bioluminescence: 0,
     water: { deep: 0x1a252c, crest: 0x334e4b, foam: 0xb9bfc2 },
+  },
+  {
+    // A moonless Southern Ocean night, and the review's R10: everything the
+    // daylight presets are made of, turned down until only the broken water is
+    // left. There is a moon somewhere behind the overcast — that is what the
+    // cold, nearly spent sun colour is — but nothing that could be called
+    // light on the sea. The block hull goes to a silhouette by arithmetic
+    // rather than by intent: the scene's only lamps are the sun at an eighth
+    // of its strength and a hemisphere the colour of the haze, and the haze is
+    // as good as black.
+    //
+    // What is left to see by is the water itself. Foam is not black here — a
+    // grey-blue that reads as pale motion in the dark, and which the spray and
+    // the spume take their colour from, so the air over a breaking crest still
+    // shows. The rest is sea fire.
+    label: 'Night',
+    sunIntensity: 0.12,
+    sunDir: [-0.45, 0.26, 0.55],
+    sunColour: 0x9fb0c8,
+    skyTop: 0x080d16,
+    skyHaze: 0x141d28,
+    ambient: 0x161d26,
+    fogDensity: 2.2,
+    glare: 0.06,
+    exposure: 0.7,
+    rain: 0,
+    bioluminescence: 1,
+    // The glowing wake road. By day the field forgets in 8 s so scars stay
+    // lace; the night glow squares the field before painting, so it can hold
+    // half a minute of memory without the daylight whitewash.
+    foamHalfLife: 30,
+    water: { deep: 0x080f14, crest: 0x0d1a18, foam: 0x6b7681, glow: 0x2fd6a8 },
   },
 ];
 
@@ -96,6 +133,11 @@ const LIGHTS = [
 // because the panel's visibility slider is the same number seen from the other
 // end, and the two conversions must agree about what one unit means.
 const BASE_FOG = 1.05e-4;
+
+// The colour of the fire in the water, for the presets that do not say. There
+// is a slider for how much of it there is and no picker for what colour it is:
+// a bloom is the colour a bloom is, and the library's default is that colour.
+const GLOW_COLOUR = 0x2fd6a8;
 
 // How much of the sky cube the water is allowed to believe. One would be a
 // mirror; a storm sea is not one, and the shipped procedural ramp is already
@@ -157,6 +199,10 @@ async function boot() {
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.4, 26000);
+  // The camera goes into the graph so that things parented to it are drawn —
+  // three.js only ever walks the scene. Nothing else here depends on it, and
+  // the camera's parent is the identity, so its own matrices are unchanged.
+  scene.add(camera);
 
   // The dome, and the small cube of it the water reflects. Both come out of the
   // library now, so the sea and the sky are drawn with one formula and cannot
@@ -205,6 +251,34 @@ async function boot() {
     rain: 0,
   });
   scene.add(rain.object3d);
+
+  // And what gets past the eye and on to it. Parented to the camera, which is
+  // why the camera had to go into the scene: the beads are drawn in clip space
+  // and never read that transform, but three.js has to walk to them.
+  const lens = createLens();
+  camera.add(lens.object3d);
+
+  // The one wire between the two. `spray` reports a face-full at most once a
+  // second and only where the deck pass is live; the demo decides that only a
+  // man standing on the deck has a face to catch it with, so the chase and
+  // orbit cameras — which are nobody — stay dry.
+  spray.onCameraHit = (strength) => {
+    if (VIEWS[viewIndex] === 'helm') lens.notifySpray(strength);
+  };
+
+  // The wind as it lies on the screen, so the beads shear the way the weather
+  // is actually running rather than simply falling. View space is the camera's
+  // own frame: x right, y up.
+  const windScreen = new THREE.Vector3();
+  const windWorld = new THREE.Vector3();
+  const camInverse = new THREE.Quaternion();
+
+  function lensWind() {
+    const rad = THREE.MathUtils.degToRad(WIND_FROM_DEG);
+    windWorld.set(-Math.sin(rad), 0, Math.cos(rad));
+    camInverse.copy(camera.quaternion).invert();
+    return windScreen.copy(windWorld).applyQuaternion(camInverse);
+  }
 
   // --- Ship ------------------------------------------------------------------
   const hull = new Hull({
@@ -558,6 +632,8 @@ async function boot() {
       exposure: light.exposure,
       visibilityKm: Math.round(visibilityFromFog(light.fogDensity) * 2) / 2,
       rain: light.rain ?? 0,
+      bioluminescence: light.bioluminescence ?? 0,
+      foamHalfLife: light.foamHalfLife ?? 8,
       sunIntensity: light.sunIntensity,
       ambient: hex(light.ambient),
       skyTop: hex(light.skyTop),
@@ -567,6 +643,7 @@ async function boot() {
         deep: hex(light.water.deep),
         crest: hex(light.water.crest),
         foam: hex(light.water.foam),
+        glow: hex(light.water.glow ?? GLOW_COLOUR),
       },
     };
   }
@@ -610,10 +687,18 @@ async function boot() {
       exposure: weather.exposure,
       fogDensity,
       rain: r,
+      bioluminescence: clamp(weather.bioluminescence, 0, 1),
+      foamHalfLife: weather.foamHalfLife ?? 8,
       water: {
         deep: drained(weather.water.deep, desat),
         crest: drained(weather.water.crest, desat),
         foam: drained(weather.water.foam, desat),
+        // Not drained, alone of the six. The rest of the palette is surfaces
+        // standing in a squall and a squall takes the colour out of a surface;
+        // this is an emission, and rain falling through a bloom does not turn
+        // it grey. Greying it would be the one place in this function where the
+        // coupling made the picture worse.
+        glow: drained(weather.water.glow, 0),
       },
     };
   }
@@ -637,6 +722,8 @@ async function boot() {
     spray.setLighting(lighting);
     rain.setLighting(lighting);
     rain.setWeather({ rain: lighting.rain });
+    // Heavy rain beads on the glass as well; the slider is the same slider.
+    lens.setWeather({ rain: lighting.rain });
 
     sunLight.color.set(lighting.sunColour);
     sunLight.intensity = lighting.sunIntensity;
@@ -646,6 +733,10 @@ async function boot() {
 
     const cube = sky.updateReflection(renderer);
     if (cube) ocean.setReflection?.(cube, SKY_REFLECT);
+
+    // How long the water remembers follows the light: the night preset asks
+    // for a long glowing road astern, everything else keeps the daylight 8 s.
+    foam?.setHalfLife?.(lighting.foamHalfLife ?? 8);
 
     syncPanel();
     store();
@@ -670,6 +761,19 @@ async function boot() {
       text: (v) => `${v.toFixed(1)} km` },
     { key: 'rain', input: 'wRain', out: 'wRainV',
       text: (v) => (v <= 0 ? 'dry' : `${Math.round(v * 100)}%`) },
+    // The one control whose answer is not its own. How much fire is in the
+    // water is this slider; how much of it can be seen is the sky, and the sea
+    // is the only thing that knows — so the readout asks it rather than
+    // computing the same clamp a second time and getting it subtly wrong. On a
+    // lit preset the slider is honest about doing nothing.
+    { key: 'bioluminescence', input: 'wGlow', out: 'wGlowV',
+      text: (v) => {
+        if (v <= 0) return 'dark';
+        const reaching = ocean.uniforms.uGlowAmount?.value ?? v;
+        return reaching < v * 0.1
+          ? `${Math.round(v * 100)}% · too light`
+          : `${Math.round(v * 100)}%`;
+      } },
   ];
 
   // Paths rather than keys, because three of the six live under `water`.
@@ -697,9 +801,14 @@ async function boot() {
     for (const s of SWATCHES) el(s.input).value = readPath(s.path);
 
     ui.light.textContent = weather.label;
+    // What the sea is actually burning at, not what was asked for: on any lit
+    // preset the second is one and the first is nought, and the row would lie.
+    const fire = ocean.uniforms.uGlowAmount?.value ?? 0;
     ui.weather.textContent = `${
       weather.rain > 0 ? `rain ${Math.round(weather.rain * 100)}%` : 'dry'
-    } · vis ${weather.visibilityKm.toFixed(0)} km`;
+    } · vis ${weather.visibilityKm.toFixed(0)} km${
+      fire > 0.01 ? ` · fire ${Math.round(fire * 100)}%` : ''
+    }`;
   }
 
   for (const s of SLIDERS) {
@@ -740,10 +849,12 @@ async function boot() {
         glare: env.glare,
         exposure: env.exposure,
         rain: env.rain,
+        bioluminescence: env.bioluminescence,
         water: {
           deep: asHex(env.water.deep),
           crest: asHex(env.water.crest),
           foam: asHex(env.water.foam),
+          glow: asHex(env.water.glow),
         },
         weather: { ...weather, water: { ...weather.water } },
       },
@@ -804,6 +915,7 @@ async function boot() {
     weather.exposure = num(saved.exposure, 0.4, 2, weather.exposure);
     weather.visibilityKm = num(saved.visibilityKm, 1, 40, weather.visibilityKm);
     weather.rain = num(saved.rain, 0, 1, weather.rain);
+    weather.bioluminescence = num(saved.bioluminescence, 0, 1, weather.bioluminescence);
     weather.sunIntensity = num(saved.sunIntensity, 0, 6, weather.sunIntensity);
     weather.ambient = col(saved.ambient, weather.ambient);
     weather.skyTop = col(saved.skyTop, weather.skyTop);
@@ -812,6 +924,7 @@ async function boot() {
     weather.water.deep = col(saved.water?.deep, weather.water.deep);
     weather.water.crest = col(saved.water?.crest, weather.water.crest);
     weather.water.foam = col(saved.water?.foam, weather.water.foam);
+    weather.water.glow = col(saved.water?.glow, weather.water.glow);
     return true;
   }
 
@@ -938,6 +1051,9 @@ async function boot() {
     // camera for the same reason: its near layer is a box around the eye.
     spray.update(dt, camera.position);
     rain.update(dt, camera.position);
+    // Last of the three, because the spray decides during its own update
+    // whether anything has just hit the glass.
+    lens.update(dt, lensWind());
 
     // Scars, last of all and before the draw. The wake is stamped first so that
     // this frame's trail is in this frame's texture, and the field is stepped
@@ -978,6 +1094,7 @@ async function boot() {
     spray,
     sky,
     rain,
+    lens,
     foam,
     wake,
     scene,

@@ -15,6 +15,7 @@ export {
 export { WaveField } from './wavefield.js';
 export { Hull, HULL_DEFAULTS } from './hull.js';
 export { AirOverSea, AIR_DEFAULTS } from './airoversea.js';
+export { shipSeas, SHIPSEAS_DEFAULTS, DEFAULT_REGIONS } from './shipseas.js';
 
 // The rendering half. Only the foam field needs a live renderer, and only in
 // its update: everything here can be built, and its GLSL read, without a
@@ -24,4 +25,5 @@ export { createFoamField, wakeStamper } from './render/foamfield.js';
 export { createSky } from './render/sky.js';
 export { createRain } from './render/rain.js';
 export { createSpray } from './render/spray.js';
+export { createLens } from './render/lens.js';
 export { warpedGrid } from './render/grid.js';
