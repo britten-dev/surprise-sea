@@ -34,6 +34,13 @@
 // third is its sanctioned fake for a breaking lip, which must never be built
 // out of geometry the physics cannot see.
 //
+// And optionally, underneath all of that, a spectral tile: a GPU inverse-FFT
+// of a fenced, wind-aligned spectrum, sampled twice at two turns and two scales
+// so its period never shows, and used to perturb the near-field normal and
+// nothing else. It moves no vertex — not a millimetre, ever — which is why it
+// costs the identity nothing at all and why the vertex stage below is byte for
+// byte the same whether it is switched on or off. See render/fftcascade.js.
+//
 // Two things are decoupled from the game this was ported out of. Lighting is a
 // plain object handed in and swappable — no mood system, no config import — and
 // foam is keyed to the sea state rather than baked for a Southern Ocean storm:
@@ -214,9 +221,9 @@ export const agxToneMapChunk = /* glsl */ `
  * Generated rather than constant, because the near-field normal pass needs the
  * wave table compiled in at the right length — and because a caller who has
  * turned that pass off should not be paying for the uniforms either. The foam
- * field and the sky reflection are compiled in the same way and for the same
- * reason: a phone with no foam field is running the shader it ran before either
- * of them existed, down to the uniform declarations.
+ * field, the sky reflection and the spectral cascade are compiled in the same
+ * way and for the same reason: a phone with none of them is running the shader
+ * it ran before any of them existed, down to the uniform declarations.
  */
 const fragmentShader = (waveCount, normalRange, detailCount, features = {}) => /* glsl */ `
   ${normalRange > 0 ? oceanNormalChunk(waveCount) : ''}
@@ -261,6 +268,14 @@ ${features.foamField ? `
 ` : ''}${features.reflection ? `
   uniform samplerCube uSkyRefl;
   uniform float uSkyReflAmount; // 0 = the procedural ramp, exactly as before
+` : ''}${features.cascade ? `
+  // The spectral cascade: one tiling patch of inverse-FFT slope, plus a scalar
+  // of micro-foam energy in its third channel. See render/fftcascade.js.
+  uniform sampler2D uCascade;
+  uniform float uCascadeInvPatch; // 1 / the tile's width in metres
+  uniform float uCascadeGain;     // 0 leaves the near field exactly as it was
+  uniform float uCascadeFoam;     // micro-foam into the lace, at a low gain
+  uniform float uCascadeFar;      // metres at which the tile has faded out
 ` : ''}
   varying vec3 vNormal;
   varying vec3 vWorldPos;
@@ -315,6 +330,40 @@ ${normalRange > 0 ? `
       nf = normalize(nf + detailSlope(vUndisp, camDistF, uTime) * uDetail);` : ''}
       n = normalize(mix(vNormal, nf, nearAmt));
     }
+` : ''}${features.cascade ? `
+    // --- The spectral cascade -----------------------------------------------
+    // Below the wavelets, the octaves no table could hold: a hundred and
+    // twenty-eight square of inverse-FFT slope over a thirty-six metre patch,
+    // world-anchored and tiling. It perturbs this normal and it does nothing
+    // else — no vertex has ever heard of it — so all it can cost the identity
+    // is a shade of light on water that is exactly where the CPU says it is.
+    //
+    // Sampled twice, which is the whole of the detiling. The first sample is
+    // the tile as it lies; the second is the same tile turned sixty-two degrees
+    // and shrunk to two fifths, at an offset of its own. Two lattices at an
+    // angle with no common period leave nothing for the eye to lock on to, and
+    // the small one comes with a bonus: at two fifths the scale it carries the
+    // octave *below* the grid's own Nyquist, for the price of a second fetch.
+    float cascFoam = 0.0;
+    float cascAmt = uCascadeGain * (1.0 - smoothstep(uCascadeFar * 0.45, uCascadeFar, dist));
+    if (cascAmt > 0.002) {
+      vec2 cp = vUndisp * uCascadeInvPatch;
+      vec4 broad = texture2D(uCascade, cp);
+
+      vec2 rp = vec2(cp.x * 0.4695 - cp.y * 0.8829, cp.x * 0.8829 + cp.y * 0.4695)
+              * 0.41 + vec2(0.317, 0.113);
+      vec4 fine = texture2D(uCascade, rp);
+      // The turned sample's slope is measured in its own turned frame, so it is
+      // turned back before the two are added. Miss this and the fine octave
+      // lights from sixty degrees off the wind.
+      vec2 fineSlope = vec2(fine.x * 0.4695 + fine.y * 0.8829,
+                           -fine.x * 0.8829 + fine.y * 0.4695);
+
+      vec2 slope = broad.xy * 0.62 + fineSlope * 0.52;
+      cascFoam = max(broad.z, fine.z) * cascAmt;
+
+      n = normalize(n + vec3(-slope.x, 0.0, -slope.y) * cascAmt);
+    }
 ` : ''}
     // Ripple the analytic normal with drifting noise. This is the texture of
     // wind on water; beyond a few hundred metres it would only shimmer, so it
@@ -328,7 +377,13 @@ ${normalRange > 0 ? `
     // of building the wavelets was to *replace* fakery rather than add to it.
     float rippleAmt = uRipple * exp(-dist / 900.0)
                     * (1.0 - ${detailCount > 0 ? '(0.55 + 0.30 * uDetail)' : '0.55'} * nearAmt);
-    if (rippleAmt > 0.01) {
+${features.cascade ? `    // And down again wherever the cascade is running. The noise and the tile
+    // stand in for the same missing octaves, and the point of building the tile
+    // was to *replace* fakery rather than to add to it — so the total quantity
+    // of invention on the near water falls as this layer lands, which is the
+    // trade R9 asked for by name.
+    rippleAmt *= 1.0 - 0.75 * cascAmt;
+` : ''}    if (rippleAmt > 0.01) {
       vec2 rp = vUndisp * 0.31 + uWindDir * uTime * -1.4;
       float e = 0.9;
       float gx = fbm(rp + vec2(e, 0.0)) - fbm(rp - vec2(e, 0.0));
@@ -469,6 +524,16 @@ ${detailCount > 0 ? `
       // answer twenty metres astern, where broken water has a rim to it.
       crestFoam = mix(crestFoam, smoothstep(0.12, 0.72, crestFoam), laceAmt * 0.6);
     }
+` : ''}${features.cascade ? `
+    // The tile's own micro foam: the steepest facets in the wavelet field,
+    // which is where a wind sea goes white at a scale no crest sum could reach.
+    // Weighted toward water that is already breaking, because that is where a
+    // fleck of white belongs — but not only there. A storm sea has scattered
+    // white all over it, and a quarter of the term reaches bare water for
+    // exactly that reason. The gain is low by construction: this is texture on
+    // foam, not a second opinion about where the sea is breaking.
+    crestFoam = clamp(
+      crestFoam + cascFoam * uCascadeFoam * (0.25 + 0.75 * crestFoam), 0.0, 1.0);
 ` : ''}
     crestFoam *= 0.22 + 0.78 * exp(-dist / 5500.0);
 
@@ -639,7 +704,7 @@ function setColour(uniform, value) {
  *                   the clock, so the mesh can never drift out of step with the
  *                   physics reading the same field.
  * @param options    { quality, windFromDeg, fogDensity, lighting, foamField,
- *                     detail }
+ *                     cascade, detail }
  *                   quality: { gridN, halfSpan, exponent, normalRange } —
  *                            normalRange also governs the near-field wavelets;
  *                            nought compiles both out.
@@ -649,6 +714,9 @@ function setColour(uniform, value) {
  *                               of them the colour of the sea fire.
  *                   foamField: a createFoamField, or nothing at all — see
  *                              `setFoamField` below.
+ *                   cascade: a createDetailCascade, or nothing at all — see
+ *                            `setDetailCascade` below. Declined if it reports
+ *                            itself disabled or if normalRange is nought.
  *                   detail: 0..1, the starting value of `setDetail`.
  */
 export function createOcean(waveField, options = {}) {
@@ -721,14 +789,19 @@ export function createOcean(waveField, options = {}) {
   let detail = detailTable(sea);
   if (detailCount > 0) Object.assign(uniforms, detailUniforms(detail));
 
-  // The two optional layers. Both are compiled in rather than switched at
-  // runtime, so an ocean with neither is byte for byte the shader it was before
-  // either existed — no sampler bound, no uniform declared, nothing to pay for.
-  // The names of the uniform objects are fixed by Amendment II because two
-  // agents build against them from opposite sides.
+  // The three optional layers. Every one of them is compiled in rather than
+  // switched at runtime, so an ocean with none is byte for byte the shader it
+  // was before any of them existed — no sampler bound, no uniform declared,
+  // nothing to pay for. The foam and reflection uniform names are fixed by
+  // Amendment II because two agents build against them from opposite sides;
+  // the cascade's follow the same rule for the same reason.
   const FIELD_UNIFORMS = ['uFoamField', 'uFoamOrigin', 'uFoamInvExtent', 'uFoamAmount'];
+  const CASCADE_UNIFORMS = [
+    'uCascade', 'uCascadeInvPatch', 'uCascadeGain', 'uCascadeFoam', 'uCascadeFar',
+  ];
   let foamField = null;
   let reflection = null;
+  let cascade = null;
 
   /** Adopt the field's own uniform objects: it ping-pongs its render targets
    *  every update, and this is what saves the sea from being told about it. */
@@ -741,12 +814,32 @@ export function createOcean(waveField, options = {}) {
     }
   }
 
+  /**
+   * The same arrangement for the cascade, with two refusals in it.
+   *
+   * A cascade that reported itself disabled — no float render targets on this
+   * machine — is declined here rather than at every call site, so a game may
+   * hand one over unconditionally and still get the sea it would have had. And
+   * a phone build, which is what `normalRange` at nought means, never takes one
+   * at all: the tile is sampled inside the near-field treatment and there is no
+   * near-field treatment to sample it from.
+   */
+  function adoptCascade(next) {
+    for (const key of CASCADE_UNIFORMS) delete uniforms[key];
+    cascade = next && !next.disabled && normalRange > 0 ? next : null;
+    if (!cascade) return;
+    for (const key of CASCADE_UNIFORMS) {
+      uniforms[key] = cascade.uniforms?.[key] ?? { value: null };
+    }
+  }
+
   const makeMaterial = () =>
     new THREE.ShaderMaterial({
       vertexShader: vertexShader(waveCount, detailCount),
       fragmentShader: fragmentShader(waveCount, normalRange, detailCount, {
         foamField: foamField !== null,
         reflection: reflection !== null,
+        cascade: cascade !== null,
       }),
       uniforms,
       // The tone curve is applied in the shader, on the assembled scene value.
@@ -756,6 +849,7 @@ export function createOcean(waveField, options = {}) {
     });
 
   adoptFoamField(options.foamField);
+  adoptCascade(options.cascade);
 
   const material = makeMaterial();
 
@@ -877,6 +971,30 @@ export function createOcean(waveField, options = {}) {
       const had = foamField !== null;
       adoptFoamField(foamOrNull);
       if (had !== (foamField !== null)) rebuild();
+    },
+
+    /**
+     * Put the spectral cascade under the near field, or take it away again.
+     *
+     * With one set, the fragment stage samples a tiling slope tile twice and
+     * perturbs the near-field normal with it, and turns the fbm ripple down by
+     * the same amount — the tile is what the noise was pretending to be. With
+     * `null` the shader is regenerated without a line of it: no sampler, no
+     * uniforms, not a cycle spent, and the source is byte for byte the string
+     * it was before. That is the phone path and the A/B both, which is why this
+     * is a recompile rather than a branch.
+     *
+     * The cascade's own uniform objects are adopted rather than copied, the
+     * arrangement `setFoamField` already uses. A cascade that could not build
+     * its render targets, or an ocean built with `quality.normalRange` at
+     * nought, is quietly declined: see `adoptCascade`.
+     *
+     * @param cascadeOrNull  a createDetailCascade, or null.
+     */
+    setDetailCascade(cascadeOrNull) {
+      const had = cascade !== null;
+      adoptCascade(cascadeOrNull);
+      if (had !== (cascade !== null)) rebuild();
     },
 
     /**

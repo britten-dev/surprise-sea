@@ -333,6 +333,37 @@ async function boot() {
     wake = null;
   }
 
+  // --- The cascade -----------------------------------------------------------
+  // The spectral tile under the near field. Desktop only: it is ten render
+  // passes a frame and a phone that is already carrying two wave loops per
+  // pixel has no business paying for them. Guarded like every other layer, and
+  // guarded twice over — a machine whose GPU will not render into a float
+  // target hands back a cascade that says `disabled`, and the sea never hears
+  // of it, and the page boots into exactly the water it had before.
+  let cascade = null;
+  let cascadeOn = false;
+
+  if (!IS_COARSE) {
+    try {
+      cascade = lib.createDetailCascade?.(field, { renderer }) ?? null;
+      if (cascade?.disabled) {
+        console.info(
+          'No float render targets on this GPU; the spectral cascade stays ashore.'
+        );
+        cascade.dispose?.();
+        cascade = null;
+      }
+      if (cascade) {
+        ocean.setDetailCascade?.(cascade);
+        cascadeOn = true;
+      }
+    } catch (err) {
+      console.warn('No spectral cascade; the near water keeps its noise.', err);
+      cascade = null;
+      cascadeOn = false;
+    }
+  }
+
   // --- Controls --------------------------------------------------------------
   const held = new Set();
   let rudder = 0;   // -1 port .. +1 starboard, where the wheel actually is
@@ -404,6 +435,26 @@ async function boot() {
         panel.hidden = !panel.hidden;
         note(panel.hidden ? 'Weather panel closed' : 'Weather panel — E to close');
         break;
+      // The A/B. A uniform rather than a detach, so the two seas can be flipped
+      // between at will and the eye can be asked the only question that
+      // matters — is the near water better with it than without — without a
+      // recompile's hitch in the middle of the comparison. For the other half
+      // of the proof, that nought really is the shader that shipped before any
+      // of this, the console has `sea.ocean.setDetailCascade(null)`.
+      case 'KeyF':
+        if (!cascade) {
+          note('No spectral cascade on this machine');
+          break;
+        }
+        cascadeOn = !cascadeOn;
+        cascade.setGain(cascadeOn ? 1 : 0);
+        note(
+          cascadeOn
+            ? `Cascade on — ${cascade.size}² spectral tile over ${cascade.patch} m`
+            : 'Cascade off — the near water is back to noise'
+        );
+        syncDetail();
+        break;
       case 'Space':
         rudder = 0;
         held.delete('ArrowLeft'); held.delete('ArrowRight');
@@ -435,6 +486,10 @@ async function boot() {
     // other half of the round owns.
     rain.setSeaState?.(seaState);
     foam?.setSeaState?.(seaState);
+    // The tile is re-drawn from the new sea's own seed, so a preset swapped
+    // away and back comes back with the chop it had rather than a fresh roll.
+    cascade?.setSeaState?.(seaState);
+    syncDetail();
     // The air takes its wind from the sea state, so it would follow along by
     // itself; building it anew starts the gusts fresh with the new weather.
     air = new AirOverSea(field);
@@ -519,7 +574,7 @@ async function boot() {
 
   const ui = {
     preset: el('vPreset'), wind: el('vWind'), light: el('vLight'), view: el('vView'),
-    weather: el('vWeather'),
+    weather: el('vWeather'), detail: el('vDetail'),
     speed: el('vSpeed'), heading: el('vHeading'), surf: el('vSurf'),
     rudder: el('vRudder'), authority: el('vAuthority'), risk: el('vRisk'),
     helmFill: el('helmFill'), authFill: el('authFill'),
@@ -527,6 +582,27 @@ async function boot() {
   };
 
   let textClock = 0;
+
+  /**
+   * The near-field row. Written only when it can have changed — the cascade is
+   * either on or off and nothing else moves it — rather than on the text clock,
+   * which is the arrangement the light and weather rows already use.
+   *
+   * It reports the tile's slope RMS as well as its state, because that number
+   * is the whole budget of this layer: it falls with the sea state and it is
+   * the one figure that says how much of the near water is the cascade's.
+   */
+  function syncDetail() {
+    if (!ui.detail) return;
+    if (!cascade) {
+      ui.detail.textContent = 'wavelets only';
+      return;
+    }
+    const rms = cascade.table?.slopeRms ?? 0;
+    ui.detail.textContent = cascadeOn
+      ? `wavelets + ${cascade.size}² @ ${cascade.patch} m · slope ${rms.toFixed(3)}`
+      : 'wavelets only (F for the cascade)';
+  }
 
   function note(text) {
     const t = field.time;
@@ -1063,6 +1139,10 @@ async function boot() {
       else wake.update?.(dt);
     }
     foam?.update?.(renderer, dt, camera.position);
+    // And the spectral tile, last of the render-target work and still before
+    // the draw: the ocean shader is about to sample it, and it is drawn for
+    // this instant of this sea rather than for the last one.
+    cascade?.update?.(renderer);
 
     updateHud(dt);
 
@@ -1070,6 +1150,8 @@ async function boot() {
   }
 
   // --- Go --------------------------------------------------------------------
+
+  syncDetail();
 
   const clock = new THREE.Clock();
   renderer.setAnimationLoop(() => {
@@ -1097,6 +1179,7 @@ async function boot() {
     lens,
     foam,
     wake,
+    cascade,
     scene,
     camera,
     renderer,

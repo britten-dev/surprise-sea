@@ -4,10 +4,11 @@
 // that needs a GL context — the material is only compiled the first time
 // something renders it. So the whole of the generated GLSL can be read here,
 // which matters more for this file than for most: the ocean shader now comes in
-// four shapes (foam field on or off, sky reflection on or off) and the promise
-// attached to the plainest of them is that it is the shader that shipped before
-// either layer existed, down to the uniform declarations. A phone pays for
-// nothing it has not asked for, and that is a claim about a string.
+// eight shapes (foam field, sky reflection and spectral cascade, each on or
+// off) and the promise attached to the plainest of them is that it is the
+// shader that shipped before any of the three existed, down to the uniform
+// declarations. A phone pays for nothing it has not asked for, and that is a
+// claim about a string.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,6 +17,7 @@ import { createSeaState } from '../src/spectrum.js';
 import { WaveField } from '../src/wavefield.js';
 import { createOcean, foamProfile } from '../src/render/ocean.js';
 import { createFoamField } from '../src/render/foamfield.js';
+import { createDetailCascade } from '../src/render/fftcascade.js';
 
 const QUALITY = { gridN: 16, halfSpan: 400, exponent: 2.2, normalRange: 400 };
 
@@ -105,13 +107,86 @@ test('each of the four declares exactly the uniforms it uses', () => {
   }
 });
 
-test('the plain shader has never heard of either layer', () => {
+test('the plain shader has never heard of any of the three', () => {
   const { plain } = fourWays();
   const src = plain.mesh.material.fragmentShader;
   for (const name of ['uFoamField', 'uFoamOrigin', 'uFoamInvExtent', 'uFoamAmount',
-                      'uSkyRefl', 'uSkyReflAmount', 'texture2D', 'samplerCube']) {
+                      'uSkyRefl', 'uSkyReflAmount', 'uCascade', 'cascAmt', 'cascFoam',
+                      'texture2D', 'samplerCube']) {
     assert.ok(!src.includes(name), `the phone path is paying for ${name}`);
   }
+});
+
+// --- All eight of them --------------------------------------------------------
+
+/**
+ * Every combination of the three optional layers, built from one wave field so
+ * they are comparable. The claim under test is not that any one of them works —
+ * their own files test that — but that they are independent: eight distinct
+ * shaders, each declaring exactly what it uses, and one vertex stage between
+ * the lot of them, because none of the three is allowed to move a vertex.
+ */
+function everyWay() {
+  const field = new WaveField(createSeaState({ preset: 'storm' }), 40000);
+  const foam = fieldFor(field);
+  const cascade = createDetailCascade(field, { size: 32 });
+  const cube = { isCubeTexture: true, name: 'sky' };
+
+  const built = new Map();
+  for (const withField of [false, true]) {
+    for (const withRefl of [false, true]) {
+      for (const withCascade of [false, true]) {
+        const ocean = createOcean(field, {
+          quality: QUALITY,
+          foamField: withField ? foam : null,
+          cascade: withCascade ? cascade : null,
+        });
+        if (withRefl) ocean.setReflection(cube, 1);
+        const label = [
+          withField ? 'field' : '—',
+          withRefl ? 'reflection' : '—',
+          withCascade ? 'cascade' : '—',
+        ].join('/');
+        built.set(label, ocean);
+      }
+    }
+  }
+  return built;
+}
+
+test('the three layers make eight distinct shaders and one vertex stage', () => {
+  const all = everyWay();
+  const frags = new Set([...all.values()].map((o) => o.mesh.material.fragmentShader));
+  assert.equal(frags.size, 8, 'two of the eight compiled to the same thing');
+
+  // The law: all three are shading, and the geometry the physics samples must
+  // not know that any of it is happening.
+  const verts = new Set([...all.values()].map((o) => o.mesh.material.vertexShader));
+  assert.equal(verts.size, 1, 'a shading layer moved a vertex');
+});
+
+test('each of the eight declares exactly the uniforms it uses', () => {
+  for (const [label, ocean] of everyWay()) {
+    assertUniformsExact(ocean.mesh.material.fragmentShader, `${label} fragment`);
+    assertUniformsExact(ocean.mesh.material.vertexShader, `${label} vertex`);
+  }
+});
+
+test('turning one layer on never disturbs another', () => {
+  // Each of the three contributes its own block and nothing else: the shader
+  // with all three is the plain one with three insertions, so anything the
+  // plain shader says the full one still says, word for word.
+  const all = everyWay();
+  const plain = all.get('—/—/—').mesh.material.fragmentShader;
+  const full = all.get('field/reflection/cascade').mesh.material.fragmentShader;
+
+  for (const line of ['float lam = max(0.0, dot(n, sun));',
+                      'col += uSunColour * pow(ndh, 240.0) * 0.9 * uGlare;',
+                      'float fog = 1.0 - exp(-f * f);',
+                      'vec3 col = mix(water, skyCol, fresnel);']) {
+    assert.ok(plain.includes(line) && full.includes(line), line);
+  }
+  assert.ok(full.length > plain.length);
 });
 
 test('the field shader samples the field and takes the whitest answer', () => {
@@ -223,6 +298,7 @@ test('a live change of sea keeps whatever layers are switched on', () => {
   const { field, ocean } = rig();
   ocean.setFoamField(fieldFor(field));
   ocean.setReflection({ isCubeTexture: true }, 1);
+  ocean.setDetailCascade(createDetailCascade(field, { size: 32 }));
 
   // A different *number* of waves changes #define NW, which is compiled in: the
   // rebuild that answers it must not quietly drop the layers with it.
@@ -231,6 +307,7 @@ test('a live change of sea keeps whatever layers are switched on', () => {
   assert.ok(src.includes('#define NW 17'));
   assert.ok(src.includes('uFoamField'), 'the foam field went with the old material');
   assert.ok(src.includes('uSkyRefl'), 'the reflection went with the old material');
+  assert.ok(src.includes('uCascade'), 'the cascade went with the old material');
   assertUniformsExact(src, 'seventeen-wave fragment');
 });
 
