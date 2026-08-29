@@ -370,3 +370,46 @@ The demo gains one weather object and a control panel (toggle with `E`):
   never matters), tests for what is testable headlessly.
 - Neither touches src/seastate.js, src/spectrum.js, src/hull.js,
   src/wavefield.js, src/airoversea.js, or src/render/spray.js this round.
+
+---
+
+# Amendment III — the sea comes aboard
+
+`shipSeas(hull, waveField, options)` — src/shipseas.js. The generic half of
+ship–sea interaction: WHERE, WHEN and HOW HARD water comes aboard, as
+numbers and events. No rendering, no GL, no geometry beyond points — the
+game binds the dressing (sheeting decks, smashed glass) to its own mesh.
+
+```js
+const seas = shipSeas(hull, waveField, {
+  freeboard: 3.2,          // deck above waterline amidships
+  sheer: 1.2,              // extra height of deck at bow and stern
+  regions: null,           // default: foredeck / waist / quarterdeck from hull.length
+});
+seas.update(dt);           // after hull.update, same tick
+```
+
+Per update, transform a fixed set of hull-local sample points (bow, stern,
+port and starboard rail rows, one centre point per deck region) through the
+hull's position/quaternion, and compare against `heightAt` there:
+
+- `onBowPlunge({ energy, x, z })` — the bow's downward velocity relative to
+  the local water surface exceeds a threshold while the bow point is
+  immersed. `energy` 0..1 from relative velocity². Rate-limit ~1/s.
+- `onGreenWater({ region, depth })` — water level above a region's deck
+  point; fires on the rising edge per shipped sea. Continuous state in
+  `seas.water[region]` (0..1): fed by immersion depth, drained at
+  `drainRate` (~0.4/s). This is the scalar a game sheets water with.
+- `onSternSea({ force })` — overtaking crest buries the stern point while
+  the wave travels faster than the ship: the pooping event with a force
+  behind it (relative closing velocity²). The stern-window smasher.
+- `onRailDip({ side })` — roll+heave puts a rail row under; fires per
+  immersion episode per side.
+
+All thresholds named options with documented defaults, tuned so: calm fires
+nothing, storm running downwind at 60% thrust takes occasional bow plunges
+and rare stern seas, greybeards at full thrust is regularly wet and a broach
+dips the rail. Deterministic, NaN-free forever, hull never written to.
+`seas.stats` counts every event kind. Tests drive a real Hull through real
+presets and assert those behaviours, plus decay, rate limits, and that
+region defaults span the hull. Export from index.js.
