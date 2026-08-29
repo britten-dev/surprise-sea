@@ -6,6 +6,7 @@
   "description": "A reusable Southern Ocean: parametric storm seas, identical on CPU and GPU, with hull seakeeping for ships that must live on them.",
   "scripts": {
     "dev": "vite",
+    "build": "vite build",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
