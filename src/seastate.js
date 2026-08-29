@@ -280,6 +280,49 @@ export function waveUniforms(seaState) {
 }
 
 /**
+ * How long foam outlives the crest that made it.
+ *
+ * A Gerstner pinch heals the instant the wave moves on, so foam keyed straight
+ * off `crestAt` appears and vanishes with the crest — which is why the sea has
+ * always looked freshly laundered between sets. Real broken water stays white
+ * for half a minute and streams away downwind. Short of a feedback texture,
+ * the cheapest honest memory is to ask the *same* crest sum what it was doing a
+ * few seconds ago and keep whichever answer is whitest: foam is then left
+ * behind along the track the crest came down, and fades as the weights decay.
+ *
+ * Two lags is enough to read as a trail rather than as two ghosts. The table
+ * is exported because it is the rule, not a shader detail: a game wanting to
+ * ask "is this water broken?" on the CPU should take the same decayed max of
+ * `crestAt` over the same lags and get the same answer the eye is being given.
+ */
+export const FOAM_LAGS = [
+  { lag: 2.5, weight: 0.55 },
+  { lag: 5.0, weight: 0.3 },
+];
+
+/** GLSL has no integer/float coercion: 5 must be written 5.0 or it will not compile. */
+const glslFloat = (v) => (Number.isInteger(v) ? v.toFixed(1) : String(v));
+
+/**
+ * The wave table as it appears to a shader stage. Both chunks below open with
+ * this; they are meant for *different* stages, so the repeated declarations
+ * never collide, and the uniforms are shared across the linked program.
+ */
+function waveArrayDeclarations(waveCount) {
+  return /* glsl */ `
+  #define NW ${waveCount}
+
+  uniform vec2 uWaveDir[NW];
+  uniform float uWaveK[NW];
+  uniform float uWaveOmega[NW];
+  uniform float uWaveAmp[NW];
+  uniform float uWaveQ[NW];
+  uniform float uWaveLen[NW];
+  uniform float uWavePhase[NW];
+`;
+}
+
+/**
  * The GLSL twin of `displacedPointAt` — forward Gerstner displacement of a
  * grid vertex, with the analytic normal and the crest pinch the foam keys off.
  *
@@ -291,19 +334,30 @@ export function waveUniforms(seaState) {
  * it can resolve. Near the camera — where a hull actually is — the attenuation
  * is one and the two halves agree exactly.
  *
+ * The crest it reports carries `FOAM_LAGS` worth of memory. Geometry does not:
+ * position and normal are the instantaneous surface, exactly as before, so the
+ * water a hull floats on is untouched by any of this.
+ *
  * @param waveCount  must match `seaState.waves.length`.
  */
 export function oceanVertexChunk(waveCount = 12) {
-  return /* glsl */ `
-  #define NW ${waveCount}
+  const lagDecl = FOAM_LAGS.map((_, i) => `    float crestLag${i} = 0.0;`).join('\n');
 
-  uniform vec2 uWaveDir[NW];
-  uniform float uWaveK[NW];
-  uniform float uWaveOmega[NW];
-  uniform float uWaveAmp[NW];
-  uniform float uWaveQ[NW];
-  uniform float uWaveLen[NW];
-  uniform float uWavePhase[NW];
+  // θ(t − τ) = k·d·p − ω(t − τ) + φ = θ(t) + ω·τ. So a lagged crest sum costs
+  // one extra sine per wave, not another pass over the table.
+  const lagSums = FOAM_LAGS.map(
+    ({ lag }, i) =>
+      `      crestLag${i} += qka * sin(theta + uWaveOmega[i] * ${glslFloat(lag)});  // uTime - ${glslFloat(lag)}`
+  ).join('\n');
+
+  // Nested, because GLSL's max takes two arguments however many lags there are.
+  const lagFold = FOAM_LAGS.reduce(
+    (acc, { weight }, i) => `max(${acc}, crestLag${i} * ${glslFloat(weight)})`,
+    'crest'
+  );
+
+  return /* glsl */ `
+  ${waveArrayDeclarations(waveCount)}
   uniform float uTime;
 
   // Displace a point on the datum plane; returns position, writes normal and
@@ -312,6 +366,9 @@ export function oceanVertexChunk(waveCount = 12) {
     vec3 pos = vec3(p.x, 0.0, p.y);
     normal = vec3(0.0, 1.0, 0.0);
     crest = 0.0;
+
+    // Where the crest was, a few seconds back. See FOAM_LAGS.
+${lagDecl}
 
     for (int i = 0; i < NW; i++) {
       float att = exp(-camDist / (uWaveLen[i] * 45.0 + 600.0));
@@ -324,6 +381,7 @@ export function oceanVertexChunk(waveCount = 12) {
       float c = cos(theta);
       float qa = uWaveQ[i] * amp;
       float ka = uWaveK[i] * amp;
+      float qka = uWaveQ[i] * ka;
 
       pos.x += d.x * qa * c;
       pos.z += d.y * qa * c;
@@ -331,13 +389,63 @@ export function oceanVertexChunk(waveCount = 12) {
 
       normal.x -= d.x * ka * c;
       normal.z -= d.y * ka * c;
-      normal.y -= uWaveQ[i] * ka * s;
+      normal.y -= qka * s;
 
-      crest += uWaveQ[i] * ka * s;
+      crest += qka * s;
+${lagSums}
     }
 
     normal = normalize(normal);
+
+    // Whitest wins. The weights are below one, so a crest always outshines its
+    // own wake and the trail decays behind it instead of smearing everything.
+    crest = ${lagFold};
+
     return pos;
+  }
+`;
+}
+
+/**
+ * The fragment-stage twin of the normal half of `gerstner`.
+ *
+ * The vertex normal is exact where it is computed and mush in between: on the
+ * warped grid a cell is metres across by fifty metres out, and interpolating a
+ * normal over one loses every crest edge inside it. That is the hole the fbm
+ * ripple has been papering over. Evaluating this per pixel over the near field
+ * does not invent a surface — it is the same analytic sum, sampled where the
+ * eye can actually resolve it, so the visible water moves *closer* to what the
+ * CPU believes rather than further away.
+ *
+ * Time is a parameter rather than a uniform read so this can drop into a stage
+ * that already declares its own clock. Waves whose attenuated amplitude has
+ * fallen below a millimetre are skipped, which is most of the table by the far
+ * edge of the near field.
+ *
+ * @param waveCount  must match `seaState.waves.length`.
+ */
+export function oceanNormalChunk(waveCount = 12) {
+  return /* glsl */ `
+  ${waveArrayDeclarations(waveCount)}
+
+  vec3 gerstnerNormal(vec2 p, float camDist, float t) {
+    vec3 normal = vec3(0.0, 1.0, 0.0);
+
+    for (int i = 0; i < NW; i++) {
+      float att = exp(-camDist / (uWaveLen[i] * 45.0 + 600.0));
+      float amp = uWaveAmp[i] * att;
+      if (amp < 0.001) continue;
+
+      vec2 d = uWaveDir[i];
+      float theta = uWaveK[i] * dot(d, p) - uWaveOmega[i] * t + uWavePhase[i];
+      float ka = uWaveK[i] * amp;
+
+      normal.x -= d.x * ka * cos(theta);
+      normal.z -= d.y * ka * cos(theta);
+      normal.y -= uWaveQ[i] * ka * sin(theta);
+    }
+
+    return normalize(normal);
   }
 `;
 }

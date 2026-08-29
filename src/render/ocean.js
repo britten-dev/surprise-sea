@@ -8,7 +8,14 @@
 // order of importance: a fresnel blend from dark upwelling colour into a mirror
 // of the sky, foam keyed off Gerstner crest pinch, spindrift streaked downwind,
 // a green translucent glow where a crest thins against the light, and fog that
-// dissolves everything into the haze the sky already wears.
+// dissolves everything into the haze the sky already wears. It ends with AgX,
+// because storm light has more range than a display does and the alternative is
+// a sea of white crests with nothing inside them.
+//
+// Close in it reaches back for the wave table and re-evaluates the analytic
+// normal per pixel. That is not extra detail invented for the eye — it is the
+// sum the CPU already walks, sampled where a metres-wide grid cell was
+// interpolating the crest edges away.
 //
 // Two things are decoupled from the game this was ported out of. Lighting is a
 // plain object handed in and swappable — no mood system, no config import — and
@@ -18,7 +25,7 @@
 // without a single number being touched.
 
 import * as THREE from 'three';
-import { waveUniforms, oceanVertexChunk } from '../seastate.js';
+import { waveUniforms, oceanVertexChunk, oceanNormalChunk } from '../seastate.js';
 import { warpedGrid } from './grid.js';
 
 // The look of the shipped storm, and the shape every lighting object takes.
@@ -29,10 +36,17 @@ const DEFAULT_LIGHTING = {
   skyHaze: 0xa6abab,
   glare: 0.3,
   fogDensity: 1.1, // a multiplier on the base density, not a density
+  // Stops in front of the tone map. Storm light is the reference at 1; a sun
+  // break wants a little more and dusk a little less.
+  exposure: 1,
   water: { deep: 0x25383c, crest: 0x3d6a5c, foam: 0xdfe4e4 },
 };
 
-const DEFAULT_QUALITY = { gridN: 352, halfSpan: 16000, exponent: 2.2 };
+// `normalRange` is how far out the fragment stage re-evaluates the analytic
+// normal per pixel, in metres. Nought turns it off outright — the wave table
+// then never reaches the fragment stage at all, which is the setting for a
+// phone with sixteen fragment uniform vectors to its name.
+const DEFAULT_QUALITY = { gridN: 352, halfSpan: 16000, exponent: 2.2, normalRange: 400 };
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
@@ -73,7 +87,94 @@ const vertexShader = (waveCount) => /* glsl */ `
   }
 `;
 
-const fragmentShader = /* glsl */ `
+/**
+ * The sky, as a function of direction.
+ *
+ * Two overlapping ramps rather than one, because a single smoothstep leaves a
+ * seam across the sky exactly where the eye is already looking. Exported as
+ * GLSL because the sea has to agree with the dome about what is overhead: a
+ * reflection is only convincing if it is a reflection *of something*, and two
+ * hand-tuned ramps drift apart the first time either is touched. Drop this in
+ * beside the dome shader and both read the same formula.
+ */
+export const skyGradientChunk = /* glsl */ `
+  vec3 skyGradient(vec3 dir, vec3 haze, vec3 top, vec3 sunDir, vec3 sunColour, float glare) {
+    float t = smoothstep(-0.16, 0.55, dir.y);
+    float t2 = smoothstep(-0.02, 0.16, dir.y);
+    vec3 col = mix(haze, top, t * 0.72 + t2 * 0.28);
+
+    // A broad, gentle glow rather than a disc — calmer, and it never glares.
+    float s = max(0.0, dot(dir, sunDir));
+    col += sunColour * pow(s, 16.0) * 0.16 * glare;
+    col += sunColour * pow(s, 220.0) * 0.40 * glare;
+    return col;
+  }
+`;
+
+/**
+ * AgX, in about twenty lines.
+ *
+ * Storm light carries an enormous range and foam sits at the top of it: with a
+ * straight clamp every crest goes to paper white and all the folding inside it
+ * is lost, while the dusk preset — which lives entirely in the bottom two
+ * stops — has nowhere to put its highlights either. AgX takes the scene into a
+ * wide gamut, log-encodes it, runs a gentle sigmoid and comes back: highlights
+ * desaturate toward white the way film does instead of clipping to it.
+ *
+ * This is the well-known compact approximation of it. The inset matrix has the
+ * sRGB → Rec.2020 conversion folded in, and a seventh-order polynomial stands
+ * in for the reference curve. In and out are both linear, so whatever colour
+ * space conversion the renderer does afterwards is unaffected.
+ *
+ * Exported so anything else drawn into the same frame — a sky dome, most
+ * obviously — can be graded identically instead of clipping beside it.
+ */
+export const agxToneMapChunk = /* glsl */ `
+  vec3 agxContrast(vec3 x) {
+    vec3 x2 = x * x;
+    vec3 x4 = x2 * x2;
+    return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4
+         - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+  }
+
+  vec3 agxToneMap(vec3 col, float exposure) {
+    const mat3 agxInset = mat3(
+      0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+      0.0784335999999992, 0.878468636469772, 0.0784336,
+      0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+    const mat3 agxOutset = mat3(
+      1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+      -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+      -0.0990297440797205, -0.0989611768448433, 1.15107367264116);
+    const float minEv = -12.47393;
+    const float maxEv = 4.026069;
+
+    col = agxInset * max(col * exposure, 0.0);
+    col = clamp(log2(max(col, 1e-10)), minEv, maxEv);
+    col = agxContrast((col - minEv) / (maxEv - minEv));
+
+    // A whisper of a grade on top. The sigmoid is deliberately flat and a grey
+    // sea comes back greyer; this is saturation only, no lift and no crush.
+    float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    col = luma + 1.12 * (col - luma);
+
+    col = agxOutset * col;
+    return clamp(pow(max(col, 0.0), vec3(2.2)), 0.0, 1.0);
+  }
+`;
+
+/**
+ * The fragment stage.
+ *
+ * Generated rather than constant, because the near-field normal pass needs the
+ * wave table compiled in at the right length — and because a caller who has
+ * turned that pass off should not be paying for the uniforms either.
+ */
+const fragmentShader = (waveCount, normalRange) => /* glsl */ `
+  ${normalRange > 0 ? oceanNormalChunk(waveCount) : ''}
+  ${skyGradientChunk}
+  ${agxToneMapChunk}
+
   uniform vec3 uDeep;
   uniform vec3 uCrestGlow;
   uniform vec3 uFoam;
@@ -97,6 +198,7 @@ const fragmentShader = /* glsl */ `
   uniform float uSpindrift;    // how much old foam the wind has to drag out
   uniform float uFoamScale;    // foam texture frequency, from the dominant wave
   uniform float uRipple;       // strength of the wind-texture normal
+  uniform float uExposure;     // stops in front of the tone map
 
   varying vec3 vNormal;
   varying vec3 vWorldPos;
@@ -123,12 +225,32 @@ const fragmentShader = /* glsl */ `
     float dist = distance(uCameraPos, vWorldPos);
     vec3 sun = normalize(uSunDir);
 
-    // Ripple the analytic normal with drifting noise, close in. This is the
-    // texture of wind on water; beyond a few hundred metres it would only
-    // shimmer, so it fades out. The fade is in metres because it is about what
-    // a pixel can resolve, not about how big the sea is.
+    // --- Surface definition -------------------------------------------------
+    // The vertex normal is exact at the vertices and mush between them: at
+    // three hundred metres the warped grid's cells are metres wide and every
+    // crest edge inside one is interpolated away. So close in, re-evaluate the
+    // *same* analytic Gerstner normal per pixel at this fragment's datum
+    // footprint, and blend back to the vertex normal as the cells shrink
+    // against the pixel and the difference stops being visible.
     vec3 n = vNormal;
-    float rippleAmt = uRipple * exp(-dist / 900.0);
+    float nearAmt = 0.0;
+${normalRange > 0 ? `
+    nearAmt = 1.0 - smoothstep(${(normalRange * 0.55).toFixed(1)}, ${normalRange.toFixed(1)}, dist);
+    if (nearAmt > 0.002) {
+      // Horizontal range, to match the attenuation the vertex stage applied.
+      float camDistF = distance(vUndisp, uCameraPos.xz);
+      vec3 nf = gerstnerNormal(vUndisp, camDistF, uTime);
+      n = normalize(mix(vNormal, nf, nearAmt));
+    }
+` : ''}
+    // Ripple the analytic normal with drifting noise. This is the texture of
+    // wind on water; beyond a few hundred metres it would only shimmer, so it
+    // fades out. The fade is in metres because it is about what a pixel can
+    // resolve, not about how big the sea is. Where the per-pixel normal is
+    // running it is turned down to what it is honestly for — micro-detail
+    // below the shortest wave in the table — rather than standing in for the
+    // definition the vertex normal was losing.
+    float rippleAmt = uRipple * exp(-dist / 900.0) * (1.0 - 0.55 * nearAmt);
     if (rippleAmt > 0.01) {
       vec2 rp = vUndisp * 0.31 + uWindDir * uTime * -1.4;
       float e = 0.9;
@@ -147,19 +269,33 @@ const fragmentShader = /* glsl */ `
 
     vec3 water = uDeep;
 
-    // Thin crests catch the light from behind and glow bottle-green. The band
-    // is set in standard deviations of wave height, so it finds the crests of
-    // whatever sea is running rather than a fixed metre mark.
-    vec2 sunH = normalize(uSunDir.xz);
-    float backlit = pow(max(0.0, dot(-viewDir.xz, sunH) * 0.5 + 0.5), 3.0);
+    // Transmission: light that went in the back of a crest and came out this
+    // side, which is what the bottle-green actually is. Four things have to be
+    // true at once and the term is the product of all four, so it switches off
+    // honestly instead of glowing wherever the water happens to be high.
+    //
+    //   forward — the sun is behind the surface from here and scattering on
+    //             through toward the eye. Two lobes stand in for the
+    //             Henyey-Greenstein one: a broad haze and a tight core.
+    //   thin    — a pinched crest is a thin crest. Measured against the very
+    //             threshold the foam breaks at, so it stays sea-state agnostic.
+    //   lifted  — the height band, in standard deviations of this sea's own
+    //             surface: crests, not troughs, whatever size the sea is.
+    //   lean    — a face tilted toward the eye has water to see through; a
+    //             flat one presents its whole depth and reads as deep.
+    float forward = max(0.0, dot(viewDir, -sun));
+    float lobe = 0.35 * forward * forward + 0.65 * pow(forward, 8.0);
+    float thin = smoothstep(0.45, 1.0, vCrest / max(uFoamHi, 1e-4));
     float lifted = smoothstep(0.19 * uHeightScale, 1.23 * uHeightScale, vHeight);
-    water += uCrestGlow * (backlit * lifted * (0.35 + uGlare * 0.65));
+    float lean = smoothstep(0.0, 0.45, 1.0 - n.y);
+    float sss = lobe * lifted * (0.35 + 0.65 * thin) * (0.5 + 0.5 * lean);
+    water += uCrestGlow * (sss * (1.4 + uGlare * 2.6));
 
-    // Reflected sky, from the same palette the dome is drawn with.
+    // Reflected sky — the same two-ramp gradient the dome overhead is drawn
+    // with, evaluated along the reflected ray, so the sea mirrors the sky that
+    // is actually there rather than an approximation of it.
     vec3 reflDir = reflect(-viewDir, n);
-    float sk = smoothstep(-0.08, 0.45, reflDir.y);
-    vec3 skyCol = mix(uSkyHaze, uSkyTop, sk);
-    skyCol += uSunColour * pow(max(0.0, dot(reflDir, sun)), 60.0) * uGlare * 0.55;
+    vec3 skyCol = skyGradient(reflDir, uSkyHaze, uSkyTop, sun, uSunColour, uGlare);
 
     vec3 col = mix(water, skyCol, fresnel);
 
@@ -199,7 +335,9 @@ const fragmentShader = /* glsl */ `
     float fog = 1.0 - exp(-f * f);
     col = mix(col, uSkyHaze, fog);
 
-    gl_FragColor = vec4(col, 1.0);
+    // Exposure and the tone curve last, on the assembled scene value — foam
+    // and glint arrive here well over one and are rolled off rather than cut.
+    gl_FragColor = vec4(agxToneMap(col, uExposure), 1.0);
 
     #include <colorspace_fragment>
   }
@@ -277,6 +415,9 @@ function setColour(uniform, value) {
  *                   the clock, so the mesh can never drift out of step with the
  *                   physics reading the same field.
  * @param options    { quality, windFromDeg, fogDensity, lighting }
+ *                   quality: { gridN, halfSpan, exponent, normalRange }
+ *                   lighting: { sunDir, sunColour, skyTop, skyHaze, glare,
+ *                               fogDensity, exposure, water }
  */
 export function createOcean(waveField, options = {}) {
   const quality = { ...DEFAULT_QUALITY, ...(options.quality ?? {}) };
@@ -314,13 +455,25 @@ export function createOcean(waveField, options = {}) {
     uSpindrift: { value: 0.3 },
     uFoamScale: { value: 1 },
     uRipple: { value: 0.3 },
+    uExposure: { value: 1 },
   };
 
-  const material = new THREE.ShaderMaterial({
-    vertexShader: vertexShader(waveCount),
-    fragmentShader,
-    uniforms,
-  });
+  // Nought disables the near-field normal pass; anything else is a range in
+  // metres, and the shader is generated around it.
+  const normalRange = Math.max(0, quality.normalRange ?? 0);
+
+  const makeMaterial = () =>
+    new THREE.ShaderMaterial({
+      vertexShader: vertexShader(waveCount),
+      fragmentShader: fragmentShader(waveCount, normalRange),
+      uniforms,
+      // The tone curve is applied in the shader, on the assembled scene value.
+      // Say so, or a renderer with its own tone mapping switched on will grade
+      // the sea a second time.
+      toneMapped: false,
+    });
+
+  const material = makeMaterial();
 
   const mesh = new THREE.Mesh(geometry, material);
   mesh.name = 'ocean';
@@ -359,6 +512,7 @@ export function createOcean(waveField, options = {}) {
     uniforms.uSunDir.value.set(...lighting.sunDir).normalize();
     uniforms.uGlare.value = lighting.glare ?? 0.4;
     uniforms.uFogDensity.value = baseFog * (lighting.fogDensity ?? 1);
+    uniforms.uExposure.value = lighting.exposure ?? 1;
   }
 
   applyFoam();
@@ -394,11 +548,7 @@ export function createOcean(waveField, options = {}) {
       if (sea.waves.length !== waveCount) {
         waveCount = sea.waves.length;
         for (const key of Object.keys(fresh)) uniforms[key] = fresh[key];
-        const replacement = new THREE.ShaderMaterial({
-          vertexShader: vertexShader(waveCount),
-          fragmentShader,
-          uniforms,
-        });
+        const replacement = makeMaterial();
         mesh.material.dispose();
         mesh.material = replacement;
       } else {

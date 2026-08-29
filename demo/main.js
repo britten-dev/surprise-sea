@@ -17,6 +17,9 @@
 // decided not to animate.
 
 import * as THREE from 'three';
+// The sky must tone-map exactly as the water does, or the horizon carries a
+// faint step where the two gradings meet.
+import { agxToneMapChunk } from '../src/render/ocean.js';
 
 // --- Settings ----------------------------------------------------------------
 
@@ -51,6 +54,7 @@ const LIGHTS = [
     ambient: 0x8b959c,
     fogDensity: 1.1,
     glare: 0.3,
+    exposure: 1.0,
     water: { deep: 0x25383c, crest: 0x3d6a5c, foam: 0xdfe4e4 },
   },
   {
@@ -63,6 +67,7 @@ const LIGHTS = [
     ambient: 0x98a09f,
     fogDensity: 0.85,
     glare: 0.95,
+    exposure: 1.15,
     water: { deep: 0x2a3f41, crest: 0x518063, foam: 0xe8e9e2 },
   },
   {
@@ -75,6 +80,7 @@ const LIGHTS = [
     ambient: 0x5d6773,
     fogDensity: 1.3,
     glare: 0.55,
+    exposure: 0.85,
     water: { deep: 0x1a252c, crest: 0x334e4b, foam: 0xb9bfc2 },
   },
 ];
@@ -108,14 +114,14 @@ async function boot() {
     throw new Error(`src/index.js would not load.\n\n${err.message}`);
   });
 
-  const missing = ['createSeaState', 'WaveField', 'Hull', 'AirOverSea', 'createOcean'].filter(
-    (name) => typeof lib[name] !== 'function'
-  );
+  const missing = [
+    'createSeaState', 'WaveField', 'Hull', 'AirOverSea', 'createOcean', 'createSpray',
+  ].filter((name) => typeof lib[name] !== 'function');
   if (missing.length) {
     throw new Error(`src/index.js is missing: ${missing.join(', ')}`);
   }
 
-  const { createSeaState, WaveField, Hull, AirOverSea, createOcean } = lib;
+  const { createSeaState, WaveField, Hull, AirOverSea, createOcean, createSpray } = lib;
 
   // --- Scene -----------------------------------------------------------------
   const canvas = el('scene');
@@ -157,6 +163,15 @@ async function boot() {
     lighting: LIGHTS[0],
   });
   scene.add(ocean.mesh);
+
+  // What the sea throws into the air. It is handed `air` as a function because
+  // the workbench builds a fresh one on every change of weather, and the spray
+  // should ride the gusting wind rather than a stale object.
+  const spray = createSpray(field, {
+    air: () => air,
+    lighting: LIGHTS[0],
+  });
+  scene.add(spray.object3d);
 
   // --- Ship ------------------------------------------------------------------
   const hull = new Hull({
@@ -274,6 +289,7 @@ async function boot() {
     // sea rather than restarting it: one instant it is a breeze, the next a gale.
     field.setSeaState(seaState);
     ocean.setSeaState(seaState);
+    spray.setSeaState(seaState);
     // The air takes its wind from the sea state, so it would follow along by
     // itself; building it anew starts the gusts fresh with the new weather.
     air = new AirOverSea(field);
@@ -285,6 +301,7 @@ async function boot() {
     lightIndex = index;
     const light = LIGHTS[index];
     ocean.setLighting(light);
+    spray.setLighting(light);
     sky.set(light);
     sunLight.color.setHex(light.sunColour);
     sunLight.intensity = light.sunIntensity;
@@ -545,6 +562,10 @@ async function boot() {
 
     updateCamera(dt);
     ocean.update(camera.position);
+    // Inside tick, so it advances under window.sea.step() like everything else,
+    // and after the camera, because where the spray is spawned depends on where
+    // the eye is and how far above the water it has got.
+    spray.update(dt, camera.position);
     updateHud(dt);
 
     renderer.render(scene, camera);
@@ -568,6 +589,7 @@ async function boot() {
     field,
     hull,
     ocean,
+    spray,
     scene,
     camera,
     renderer,
@@ -598,6 +620,7 @@ function createSky() {
     uSunDir: { value: new THREE.Vector3(0.35, 0.3, 0.65) },
     uSunColour: { value: new THREE.Color(0xdfe2de) },
     uGlare: { value: 0.3 },
+    uExposure: { value: 1.0 },
   };
 
   const material = new THREE.ShaderMaterial({
@@ -621,8 +644,11 @@ function createSky() {
       uniform vec3 uSunDir;
       uniform vec3 uSunColour;
       uniform float uGlare;
+      uniform float uExposure;
 
       varying vec3 vDir;
+
+      ${agxToneMapChunk}
 
       void main() {
         vec3 d = normalize(vDir);
@@ -636,7 +662,7 @@ function createSky() {
         col += uSunColour * pow(sun, 16.0) * 0.16 * uGlare;
         col += uSunColour * pow(sun, 220.0) * 0.40 * uGlare;
 
-        gl_FragColor = vec4(col, 1.0);
+        gl_FragColor = vec4(agxToneMap(col, uExposure), 1.0);
 
         #include <colorspace_fragment>
       }
@@ -656,6 +682,7 @@ function createSky() {
       uniforms.uSunDir.value.set(...light.sunDir).normalize();
       uniforms.uSunColour.value.setHex(light.sunColour);
       uniforms.uGlare.value = light.glare ?? 0.4;
+      uniforms.uExposure.value = light.exposure ?? 1.0;
     },
   };
 }

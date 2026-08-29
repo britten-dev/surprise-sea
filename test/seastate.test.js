@@ -5,7 +5,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createSeaState, PRESETS } from '../src/spectrum.js';
-import { SeaState, waveUniforms, oceanVertexChunk } from '../src/seastate.js';
+import {
+  SeaState,
+  waveUniforms,
+  oceanVertexChunk,
+  oceanNormalChunk,
+  FOAM_LAGS,
+} from '../src/seastate.js';
 
 const PRESET_NAMES = Object.keys(PRESETS);
 
@@ -290,6 +296,148 @@ test('the GLSL chunk is generated for the table it will be given', () => {
   assert.match(chunk, /exp\(-camDist \/ \(uWaveLen\[i\] \* 45\.0 \+ 600\.0\)\)/);
   for (const name of ['uWaveDir', 'uWaveK', 'uWaveOmega', 'uWaveAmp', 'uWaveQ', 'uWaveLen', 'uWavePhase', 'uTime']) {
     assert.ok(chunk.includes(name), `chunk is missing uniform ${name}`);
+  }
+});
+
+// GLSL will not coerce an integer literal to a float, so the generator has to
+// write 5.0 where the table says 5. Mirrored here rather than imported so a
+// slip in the generator's formatter cannot make the test agree with it.
+const asGlslFloat = (v) => (Number.isInteger(v) ? v.toFixed(1) : String(v));
+
+test('the crest sum is evaluated at every foam lag, and folded in as a max', () => {
+  const chunk = oceanVertexChunk(12);
+
+  // θ(t − τ) = θ(t) + ω·τ, so the lag appears as an offset on the phase rather
+  // than as another pass over the table. Whichever way it is written, all three
+  // sums have to be there and the fold has to keep the whitest of them.
+  FOAM_LAGS.forEach(({ lag, weight }, i) => {
+    assert.ok(
+      chunk.includes(`float crestLag${i} = 0.0;`),
+      `no accumulator for the ${lag}s lag`
+    );
+    assert.ok(
+      chunk.includes(`sin(theta + uWaveOmega[i] * ${asGlslFloat(lag)})`),
+      `the ${lag}s lagged crest sum is missing`
+    );
+    assert.ok(
+      chunk.includes(`crestLag${i} * ${asGlslFloat(weight)}`),
+      `the ${lag}s lag is not weighted ${weight}`
+    );
+  });
+
+  // A max, not a sum: foam must never make a crest read as more pinched than
+  // it is, or the geometry and the white water stop describing the same wave.
+  assert.match(chunk, /crest = max\(/);
+  assert.ok(!/crest \+= crestLag/.test(chunk), 'lagged foam must not be added in');
+
+  // And the surface itself is untouched by any of it.
+  assert.match(chunk, /pos\.y \+= amp \* s;/);
+  assert.ok(!/pos\.\w \+= crestLag/.test(chunk), 'foam memory must not move a vertex');
+});
+
+test('foam memory whitens a survival sea and leaves a millpond alone', () => {
+  // The rule the shader folds in, walked here on the CPU: FOAM_LAGS is
+  // exported precisely so a game can ask "is this water broken?" and get the
+  // answer the eye is being given. Thresholds are in standard deviations of
+  // the sea's own pinch, as the shader's are, so this says nothing about a
+  // particular preset's tuning — only about what the memory is for.
+  const folded = (sea, x, z, t) => {
+    let c = sea.crestAt(x, z, t);
+    for (const { lag, weight } of FOAM_LAGS) {
+      c = Math.max(c, sea.crestAt(x, z, t - lag) * weight);
+    }
+    return c;
+  };
+
+  const survey = (preset, sigmas) => {
+    const sea = createSeaState({ preset });
+    const budget = sea.waves.reduce((a, w) => a + w.q * w.k * w.amp, 0);
+    let sumSq = 0;
+    let n = 0;
+    const points = [];
+    for (const t of [0, 17.3, 51.9]) {
+      for (let i = -18; i <= 18; i++) {
+        for (let j = -18; j <= 18; j++) {
+          const x = i * 13.7;
+          const z = j * 11.9;
+          const c = sea.crestAt(x, z, t);
+          const f = folded(sea, x, z, t);
+
+          // Never less than the instant it is standing in for: foam may only
+          // be remembered, never forgotten.
+          assert.ok(f >= c - 1e-12, `${preset}: memory erased live foam`);
+          // And never more than the sea can pinch. The weights are all below
+          // one, so a remembered crest can never out-white a real one.
+          assert.ok(f <= budget + 1e-9, `${preset}: memory invented pinch`);
+
+          sumSq += c * c;
+          n++;
+          points.push([c, f]);
+        }
+      }
+    }
+    const sigma = Math.sqrt(sumSq / n);
+    const over = (sel) => points.filter((p) => p[sel] > sigmas * sigma).length / n;
+    return { plain: over(0), remembered: over(1) };
+  };
+
+  // A survival sea breaks constantly, so there is a wake behind every crest.
+  const heavy = survey('greybeards', 0.32);
+  assert.ok(
+    heavy.remembered > heavy.plain * 1.2,
+    `greybeards: foam went ${(100 * heavy.plain).toFixed(1)}% -> ` +
+      `${(100 * heavy.remembered).toFixed(1)}%, wanted a fifth again`
+  );
+
+  // A breeze does not, so nothing trails and the sea stays green. This is the
+  // sea-state agnosticism the whole foam section rests on: one rule, and calm
+  // water does not go white because a storm's numbers were dialled in.
+  const light = survey('breeze', 2.09);
+  assert.equal(
+    light.remembered,
+    light.plain,
+    'a breeze should have no broken water to remember'
+  );
+});
+
+test('the fragment normal chunk is the same sum, minus the displacement', () => {
+  const chunk = oceanNormalChunk(9);
+  assert.match(chunk, /#define NW 9/);
+  assert.match(chunk, /vec3 gerstnerNormal\(vec2 p, float camDist, float t\)/);
+  // The same attenuation as the vertex stage, or the per-pixel normal would
+  // describe a different sea from the one the mesh is standing in.
+  assert.match(chunk, /exp\(-camDist \/ \(uWaveLen\[i\] \* 45\.0 \+ 600\.0\)\)/);
+  // Waves the distance has already faded to nothing cost nothing.
+  assert.match(chunk, /if \(amp < 0\.001\) continue;/);
+  // It is a normal and only a normal: no position, no crest, no foam memory.
+  assert.ok(!chunk.includes('pos'), 'the normal chunk should not displace anything');
+  assert.ok(!chunk.includes('crest'), 'the normal chunk should not compute crest');
+  // Time comes in as an argument so the chunk can join a stage that already
+  // has a clock of its own.
+  assert.ok(!chunk.includes('uniform float uTime'), 'time should be a parameter here');
+});
+
+test('every uniform the chunks declare is one waveUniforms supplies', () => {
+  // The two halves of the GPU twin are generated separately now, and nothing
+  // but this stops one of them declaring something the renderer never uploads.
+  const sea = createSeaState({ preset: 'greybeards' });
+  const supplied = new Set(Object.keys(waveUniforms(sea)));
+  // The renderer owns the clock; everything else has to come off the table.
+  const fromTheRenderer = new Set(['uTime']);
+
+  for (const chunk of [oceanVertexChunk(sea.waves.length), oceanNormalChunk(sea.waves.length)]) {
+    const declared = [...chunk.matchAll(/uniform\s+\w+\s+(\w+)/g)].map((m) => m[1]);
+    assert.ok(declared.length > 0, 'a chunk that declares no uniforms cannot be right');
+    for (const name of declared) {
+      assert.ok(
+        supplied.has(name) || fromTheRenderer.has(name),
+        `${name} is declared but never uploaded`
+      );
+    }
+    // And every array the table fills is actually read.
+    for (const name of supplied) {
+      assert.ok(declared.includes(name), `${name} is uploaded but never declared`);
+    }
   }
 });
 
