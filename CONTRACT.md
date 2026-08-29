@@ -251,3 +251,122 @@ Physics agent owns `src/*.js` and `test/`. Render agent owns `src/render/`
 and `demo/`. Neither edits the other's files; both read this contract. The
 render agent codes against the signatures above even if the physics files are
 not present yet.
+
+---
+
+# Amendment II — the scarred sea, the real sky, and the weather
+
+Four additions from docs/REVIEW.md (R2-full, R3, R5, R8) plus a live
+environment panel. The law stands: nothing here may move the displaced
+geometry the physics samples. These layers are shading and air. Frame-history
+effects (the foam field, rain) are exempt from strict determinism — they are
+visual memory, not simulation truth — but must be stable, bounded, and free
+of NaNs forever. `npm test` stays green throughout; new GLSL gets
+string-level tests where a browser is not available.
+
+## FoamField — R2-full + R3  (src/render/foamfield.js, NEW)
+
+A camera-following accumulation texture: where the sea has broken or a ship
+has passed, the water stays scarred until it fades.
+
+```js
+const foam = createFoamField(waveField, {
+  size: 1024,            // texels; 512 on coarse pointers
+  extent: 2400,          // metres covered, centred on the camera
+  halfLife: 22,          // seconds for a scar to fade by half
+  windFromDeg,           // advection direction (foam drifts downwind)
+});
+foam.update(renderer, dt, cameraPos);  // MUST be callable from the demo tick,
+                                       // so it works under window.sea.step()
+foam.stamp(x, z, radius, strength);    // queue a splat (wakes, broaches);
+                                       // cheap, many per frame is fine
+foam.texture; foam.uniforms;           // whatever ocean.js needs to sample it
+foam.dispose();
+```
+
+Implementation intent: half-float ping-pong RTs; each update decays by the
+half-life, advects by the wind (sample offset upwind), injects the analytic
+crest sum evaluated in the RT's own pass (same wave uniforms — this is the
+Jacobian-fold analogue), and applies queued stamps as soft discs. The
+footprint follows the camera quantised to whole texels so the history never
+smears from re-centring; texels that scroll in start clean.
+
+Ocean sampling (src/render/ocean.js, same agent): inside the footprint the
+fragment foam term becomes `max(analytic Stage-0 foam, field sample)`, with a
+soft edge fade to the analytic fallback outside. New createOcean option
+`foamField`, new method `ocean.setFoamField(foamOrNull)`.
+
+Wakes (R3): the *library* provides `wakeStamper(hull, foam, options)` in
+foamfield.js — reads the hull's public state each call, stamps a trail at the
+stern scaled by speed (nothing below ~1 m/s), doubles width while `broached`,
+and dumps one broad splat on the broach event. The demo wires it; The
+Pursuit will reuse it.
+
+## Reflections — R5  (src/render/sky.js NEW + a hook in ocean.js)
+
+The sky dome moves from the demo into the library, so the water can reflect
+the sky that is actually overhead.
+
+```js
+const sky = createSky({ lighting });     // the dome the demo already draws
+sky.mesh; sky.setLighting(lighting);     // same fields as the ocean's
+sky.reflection;                          // mipmapped cube texture, re-rendered
+                                         // only when lighting changes (a
+                                         // CubeCamera into a small mipped
+                                         // WebGLCubeRenderTarget, ~128px)
+sky.updateReflection(renderer);          // called after setLighting; cheap
+sky.dispose();
+```
+
+Ocean hook (owned by the FoamField agent, interface fixed here so both sides
+can build against it): `ocean.setReflection(cubeTexture, amount = 1)` adds
+uniforms `uSkyRefl` (samplerCube), `uSkyReflAmount` (0 = pure procedural
+ramp, the current look). The fragment mixes the procedural ramp toward a
+roughness-blurred cube sample (mip bias by an existing roughness proxy; exact
+LOD calls are a bonus, a bias is acceptable). Foam and glints unchanged.
+
+## Rain — R8  (src/render/rain.js, NEW)
+
+```js
+const rain = createRain(waveField, { windFromDeg, lighting });
+rain.object3d;
+rain.update(dt, cameraPos);              // under the same tick as everything
+rain.setWeather({ rain });               // 0 none .. 1 blinding squall
+rain.setLighting(lighting); rain.dispose();
+```
+
+Two layers: near-camera rain streaks (a few hundred stretched sprites, wind-
+sheared, dying on the surface), and 3-6 big translucent squall-curtain
+billboards drifting downwind in the middle distance. Both scale with the
+`rain` value; 0 must cost nothing.
+
+## Weather + the panel  (demo)
+
+The demo gains one weather object and a control panel (toggle with `E`):
+
+- Sliders: sun azimuth (deg), sun elevation (deg), glare, exposure,
+  visibility (km, 1–40, mapped `fogDensity = 3 / (visibility_m)` — label it
+  visibility, store it as fog), rain (0–1).
+- Colour pickers: sky top, sky haze, sun colour, water deep, water crest,
+  foam.
+- Every control applies live to sky, ocean, spray, rain, and the scene
+  lights through the existing setLighting path plus `rain.setWeather`.
+- Rain couples: at rain r, effective fogDensity ×(1 + 1.2r) and sky/water
+  colours desaturate toward grey by up to 25% — computed in ONE place in the
+  demo and passed through setLighting, not hidden in shaders.
+- `L` still cycles the three presets (they now also carry `rain: 0`);
+  touching any slider switches to a `Custom` state; a `Copy JSON` button
+  puts the full lighting+weather object on the clipboard; the custom state
+  persists in localStorage (guarded try/catch) and survives reload.
+- Panel is plain DOM in demo/index.html + main.js, styled like the HUD.
+
+## Ownership
+
+- Agent F: src/render/foamfield.js, src/render/ocean.js (foam sampling +
+  setReflection hook), src/index.js exports, tests.
+- Agent S: src/render/sky.js, src/render/rain.js, demo/index.html,
+  demo/main.js (library sky replaces the inline one; panel; wiring foam via
+  documented API with `ocean.setFoamField?.()`-style guards so agent order
+  never matters), tests for what is testable headlessly.
+- Neither touches src/seastate.js, src/spectrum.js, src/hull.js,
+  src/wavefield.js, src/airoversea.js, or src/render/spray.js this round.
