@@ -47,7 +47,7 @@ const HAZE = {
   storm: 0xa6abab,
   sunBreak: 0xc7c3b4,
   dusk: 0x8b8178,
-  night: 0x141d28,
+  night: 0x1a2434,
 };
 
 const source = (name) =>
@@ -62,7 +62,7 @@ test('the fire is gated on a uniform, not compiled in and out', () => {
   assert.ok(src.includes('uniform vec3 uGlow;'));
   assert.ok(src.includes('uniform float uGlowAmount;'));
   assert.ok(src.includes('if (uGlowAmount > 0.0) {'), 'a dark sea pays for the whole term');
-  assert.ok(src.includes('col += uGlow * (churn * 1.2 * uGlowAmount);'));
+  assert.ok(src.includes('col += uGlow * (churn * 0.45 * uGlowAmount);'));
 
   // Emission, so it goes in as light rather than as a colour mixed toward, and
   // it goes in before the fog and the tone map: distance is entitled to take it
@@ -105,13 +105,13 @@ test('the scar field is the primary source, and only where there is one', () => 
   // The field's sample, faded at the footprint edge and scaled by how far the
   // field is believed, exactly as the foam term reads it.
   assert.ok(withField.includes('float scar = ffScar * ffFade * uFoamAmount;'));
-  assert.ok(withField.includes('churn = max(churn, scar * scar);'));
+  assert.ok(withField.includes('churn = max(churn, scar * scar * (0.3 + 0.7 * scar));'));
 
   // And the instantaneous crest, at a third the gain, in both. Squared, both of
   // them: a mask that runs linear from a tenth to one comes back off the tone
   // curve running from two thirds to one, and the sea in it is flat.
   for (const src of [withField, without]) {
-    assert.ok(src.includes('float churn = 0.34 * crestFoam * crestFoam;'));
+    assert.ok(src.includes('float churn = 0.16 * crestFoam * crestFoam;'));
   }
   assert.ok(!without.includes('ffScar'), 'a fieldless sea reads a field');
 });
@@ -220,8 +220,12 @@ test('the workbench has four moods and one of them is night', () => {
   assert.equal(night.rain, 0);
   assert.ok(night.water.glow !== undefined, 'the night has no colour of fire');
   assert.ok(night.exposure < 0.8, 'a night at daylight exposure');
-  assert.ok(night.glare < 0.15, 'the moon is glaring');
-  assert.ok(night.sunIntensity < 0.2, 'the hull will not be a silhouette');
+  // A moonlit night, by request — first cut was moonless and the fire had the
+  // whole stage. The moon is present but gentle: a silver path on the water,
+  // a faintly lit hull, and never anything a sun would own.
+  assert.ok(night.glare >= 0.2 && night.glare <= 0.6, 'the moon path is missing or glaring');
+  assert.ok(night.sunIntensity >= 0.2 && night.sunIntensity <= 0.6,
+    'the moon should light the hull faintly, and no more than faintly');
 
   // And the other three are exactly as dark as they were: nought fire, and the
   // key present rather than merely absent, so the table says what it means.

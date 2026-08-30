@@ -110,14 +110,14 @@ const LIGHTS = [
     // the spume take their colour from, so the air over a breaking crest still
     // shows. The rest is sea fire.
     label: 'Night',
-    sunIntensity: 0.12,
+    sunIntensity: 0.38,
     sunDir: [-0.45, 0.26, 0.55],
-    sunColour: 0x9fb0c8,
-    skyTop: 0x080d16,
-    skyHaze: 0x141d28,
+    sunColour: 0xc2d2e8,
+    skyTop: 0x0c1422,
+    skyHaze: 0x1a2434,
     ambient: 0x161d26,
     fogDensity: 2.2,
-    glare: 0.06,
+    glare: 0.4,
     exposure: 0.7,
     rain: 0,
     bioluminescence: 1,
@@ -125,7 +125,7 @@ const LIGHTS = [
     // lace; the night glow squares the field before painting, so it can hold
     // half a minute of memory without the daylight whitewash.
     foamHalfLife: 30,
-    water: { deep: 0x080f14, crest: 0x0d1a18, foam: 0x6b7681, glow: 0x2fd6a8 },
+    water: { deep: 0x0a1119, crest: 0x0d1a18, foam: 0x6b7681, glow: 0x2fd6a8 },
   },
 ];
 
@@ -325,7 +325,10 @@ async function boot() {
 
     if (foam) {
       ocean.setFoamField?.(foam);
-      wake = lib.wakeStamper?.(hull, foam) ?? null;
+      // Small frequent splats rather than big sparse ones: a stamp every
+      // twenty metres popped in through the squared night glow as a
+      // pulsing light under her counter.
+      wake = lib.wakeStamper?.(hull, foam, { strength: 0.72, spacingFactor: 0.25 }) ?? null;
     }
   } catch (err) {
     console.warn('No foam field; the sea will heal the instant a crest passes.', err);

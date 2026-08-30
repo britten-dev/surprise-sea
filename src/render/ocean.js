@@ -584,7 +584,7 @@ ${detailCount > 0 ? `
       // This instant's breaking crest, at a third the gain: a wave going over
       // now burns, but it is nothing beside the acre of sea it tore a minute
       // ago. Distance-faded already, along with the foam it is measured from.
-      float churn = 0.34 * crestFoam * crestFoam;${features.foamField ? `
+      float churn = 0.16 * crestFoam * crestFoam;${features.foamField ? `
       // And the memory, at full gain: the same sample the foam took, with the
       // same fade at the edge of the footprint and the same say in how far the
       // field is believed at all. The white water and the fire fade together
@@ -592,8 +592,14 @@ ${detailCount > 0 ? `
       // colour is lost against a black sea long before a green one is — so a
       // lane goes on burning after it has stopped showing white.
       float scar = ffScar * ffFade * uFoamAmount;
-      churn = max(churn, scar * scar);` : ''}
-      col += uGlow * (churn * 1.2 * uGlowAmount);
+      // Squared, then leaned on once more: the storm's minute-old ambient
+      // scars sit in the mid tones and made the whole night sea a green
+      // field; a fresh wake sits near one and keeps almost everything.
+      churn = max(churn, scar * scar * (0.3 + 0.7 * scar));` : ''}
+      // 0.55, down from a first cut of 1.2: at 1.2 a storm burned
+      // wall-to-wall and the fire read as stage light. Sea fire is an
+      // accent on a dark sea, not the sea.
+      col += uGlow * (churn * 0.45 * uGlowAmount);
     }
 
     // --- Air ----------------------------------------------------------------
