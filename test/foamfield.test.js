@@ -342,12 +342,41 @@ function mockFoam() {
 
 /** A hull, and the field she floats on. Heading north so the arithmetic is
  *  legible: forward is −z, so her stern trails away toward +z. */
-function shipRig(preset = 'calm', headingDeg = 0) {
+function shipRig(preset = 'calm', headingDeg = 0, wakeOpts = { jitter: 0 }) {
+  // jitter 0 by default HERE: these tests reason about exact geometry, and
+  // the churn is proven separately by its own test below.
   const field = new WaveField(createSeaState({ preset }), 40000);
   const hull = new Hull({ headingDeg, x: 0, z: 0 });
   const foam = mockFoam();
-  return { field, hull, foam, wake: wakeStamper(hull, foam) };
+  return { field, hull, foam, wake: wakeStamper(hull, foam, wakeOpts) };
 }
+
+test('the lane is churned, not drawn — and the churn replays', () => {
+  const run = () => {
+    const { hull, foam, wake } = shipRig('calm', 0, {}); // library default jitter
+    hull.speed = 5;
+    wake.update();
+    hull.position.z -= 60;
+    wake.update();
+    return foam.stamps;
+  };
+
+  const a = run();
+  assert.ok(a.length >= 10);
+
+  const radii = new Set(a.map((s) => s.radius.toFixed(6)));
+  const strengths = new Set(a.map((s) => s.strength.toFixed(6)));
+  assert.ok(radii.size > a.length / 2, 'the splats are all the same size');
+  assert.ok(strengths.size > a.length / 2, 'the splats all weigh the same');
+  assert.ok(a.some((s) => Math.abs(s.x) > 0.3), 'nothing ever leaves the centreline');
+  for (const s of a) {
+    assert.ok(Math.abs(s.x) <= s.radius * 0.6 + 1e-9, 'a splat left the lane entirely');
+    assert.ok(s.strength > 0 && s.strength <= 1);
+  }
+
+  // Seeded: the same voyage leaves the same water, splat for splat.
+  assert.deepEqual(run(), a);
+});
 
 test('the trail starts at the stern and runs away astern of her', () => {
   const { hull, foam, wake } = shipRig();

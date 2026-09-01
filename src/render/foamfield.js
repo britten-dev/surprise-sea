@@ -639,6 +639,12 @@ const WAKE_DEFAULTS = {
   broachStrength: 1,
   maxPerUpdate: 24, // splats per call, so one long frame cannot flood the queue
   maxSegment: 4, // ship lengths of travel past which this is a teleport
+  // How organic the lane is. At 0 the splats land identically, dead on the
+  // track, and the result is a marker line dragged across the sea — a wake
+  // you can see was *stamped*. At 1 the churn wanders half a radius and no
+  // two splats match. Seeded, so the same voyage leaves the same wake.
+  jitter: 0.55,
+  seed: 1796,
 };
 
 /**
@@ -676,6 +682,13 @@ export function wakeStamper(hull, foam, options = {}) {
   let prevZ = null;
   let carry = 0;
   let wasBroached = false;
+
+  // The library's LCG, one private stream per stamper: churn is not pattern.
+  let rngState = ((o.seed ^ 0x9e3779b9) >>> 0) || 1;
+  const rand = () => {
+    rngState = (Math.imul(rngState, 1664525) + 1013904223) >>> 0;
+    return rngState / 4294967296;
+  };
 
   const heading = () =>
     hull.headingRad ?? THREE.MathUtils.degToRad(hull.headingDeg ?? 0);
@@ -765,7 +778,19 @@ export function wakeStamper(hull, foam, options = {}) {
       let laid = 0;
       let along = spacing - carry;
       while (along <= moved && laid < o.maxPerUpdate) {
-        foam.stamp(prevX + ux * along, prevZ + uz * along, radius, strength);
+        // Identical splats laid dead on a line read as exactly that. Real
+        // churn meanders, thins, widens: each splat wanders across the track,
+        // and no two carry the same weight or reach. All bounded, so the lane
+        // stays a lane; all seeded, so a replay leaves the same water.
+        const lat = (rand() * 2 - 1) * radius * 0.5 * o.jitter;
+        const rf = 1 + (rand() * 2 - 1) * 0.35 * o.jitter;
+        const sf = 1 - rand() * 0.5 * o.jitter;
+        foam.stamp(
+          prevX + ux * along - uz * lat,
+          prevZ + uz * along + ux * lat,
+          radius * rf,
+          strength * sf
+        );
         laid++;
         along += spacing;
       }
