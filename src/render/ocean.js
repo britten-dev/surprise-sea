@@ -150,6 +150,22 @@ ${detailCount > 0 ? `
  * beside the dome shader and both read the same formula.
  */
 export const skyGradientChunk = /* glsl */ `
+  float skyHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+  float skyNoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(skyHash(i), skyHash(i + vec2(1,0)), f.x),
+      mix(skyHash(i + vec2(0,1)), skyHash(i + vec2(1,1)), f.x), f.y);
+  }
+  float skyCloud(vec2 p) {
+    float n = 0.0, a = 0.55;
+    for (int i = 0; i < 5; i++) {
+      n += a * skyNoise(p);
+      p = mat2(1.6, -1.2, 1.2, 1.6) * p + vec2(13.1, 7.7);
+      a *= 0.48;
+    }
+    return n;
+  }
   vec3 skyGradient(vec3 dir, vec3 haze, vec3 top, vec3 sunDir, vec3 sunColour, float glare) {
     float t = smoothstep(-0.16, 0.55, dir.y);
     float t2 = smoothstep(-0.02, 0.16, dir.y);
@@ -159,6 +175,18 @@ export const skyGradientChunk = /* glsl */ `
     float s = max(0.0, dot(dir, sunDir));
     col += sunColour * pow(s, 16.0) * 0.16 * glare;
     col += sunColour * pow(s, 220.0) * 0.40 * glare;
+    // A distant cloud ceiling. The same function lights the reflection cube, the
+    // visible sky and the ocean's fallback reflection; no unrelated sky photograph.
+    if (dir.y > 0.015) {
+      vec2 p = dir.xz / (dir.y + 0.18) * 1.7 + vec2(4.2, 8.1);
+      float cloud = skyCloud(p);
+      float cover = smoothstep(0.34, 0.63, cloud);
+      float edge = skyCloud(p + normalize(sunDir.xz + vec2(0.001)) * 0.10);
+      float rim = clamp((cloud - edge) * 9.0, 0.0, 1.0);
+      vec3 shade = mix(haze * 0.48, haze * 1.16 + sunColour * 0.14 * glare,
+        clamp(0.28 + rim * 0.7 + s * 0.25, 0.0, 1.0));
+      col = mix(col, shade, cover * smoothstep(0.015, 0.12, dir.y));
+    }
     return col;
   }
 `;
@@ -249,6 +277,7 @@ ${features.hullMask ? `
   uniform mat4 uHullWorldToLocal;
   uniform vec3 uHullBounds; // forward z, aft z, maximum half-breadth
   uniform vec2 uHullTexels;
+  uniform float uHullSpeed;
 
   bool insideHull(vec3 worldPosition) {
     vec3 p = (uHullWorldToLocal * vec4(worldPosition, 1.0)).xyz;
@@ -287,6 +316,10 @@ ${features.foamField ? `
 ` : ''}${features.reflection ? `
   uniform samplerCube uSkyRefl;
   uniform float uSkyReflAmount; // 0 = the procedural ramp, exactly as before
+` : ''}${features.shipReflection ? `
+  uniform sampler2D uShipReflection;
+  uniform mat4 uShipReflectionMatrix;
+  uniform float uShipReflectionAmount;
 ` : ''}${features.cascade ? `
   // The spectral cascade: one tiling patch of inverse-FFT slope, plus a scalar
   // of micro-foam energy in its third channel. See render/fftcascade.js.
@@ -494,6 +527,18 @@ ${features.reflection ? `
                    uSkyReflAmount);
     }
 ` : ''}
+${features.shipReflection ? `
+    vec4 sr = uShipReflectionMatrix * vec4(vWorldPos, 1.0);
+    if (sr.w > 0.0 && uShipReflectionAmount > 0.0) {
+      vec2 ruv = sr.xy / sr.w + n.xz * 0.025;
+      if (all(greaterThan(ruv, vec2(0.001))) && all(lessThan(ruv, vec2(0.999)))) {
+        vec4 reflected = texture2D(uShipReflection, ruv);
+        float edge = smoothstep(0.0, 0.04, min(min(ruv.x, ruv.y), min(1.0 - ruv.x, 1.0 - ruv.y)));
+        skyCol = mix(skyCol, reflected.rgb / max(reflected.a, 0.001),
+          reflected.a * uShipReflectionAmount * edge * exp(-dist / 350.0));
+      }
+    }
+` : ''}
     vec3 col = mix(water, skyCol, fresnel);
 
     // Sun glint: one tight and one broad lobe, so there is both sparkle and
@@ -568,6 +613,27 @@ ${detailCount > 0 ? `
              * uSpindrift * exp(-dist / 2600.0);
 
     float foam = clamp(crestFoam + streaks, 0.0, 1.0);
+${features.hullMask ? `
+    // Sample the hull at the height of this water fragment: foam stays at contact.
+    vec3 hp = (uHullWorldToLocal * vec4(vWorldPos, 1.0)).xyz;
+    float hu = (hp.z - uHullBounds.x) / (uHullBounds.y - uHullBounds.x);
+    if (hu > 0.0 && hu < 1.0 && abs(hp.x) < uHullBounds.z + 2.5) {
+      float hs = (0.5 + hu * (uHullTexels.x - 1.0)) / uHullTexels.x;
+      vec3 section = texture2D(uHullProfile, vec2(hs, 0.5)).rgb;
+      float hv = (hp.y - section.g) / (section.b - section.g);
+      if (hv > 0.0 && hv < 1.0) {
+        float ht = (0.5 + hv * (uHullTexels.y - 1.0)) / uHullTexels.y;
+        float gap = abs(hp.x) - texture2D(uHullProfile, vec2(hs, ht)).r;
+        float speed = smoothstep(0.3, 6.0, abs(uHullSpeed));
+        float bow = 1.0 - smoothstep(0.05, 0.38, hu);
+        float width = 0.16 + speed * (0.30 + bow * 0.9);
+        float froth = fbm(vec2(hp.x * 4.0, hp.z * 1.6 - uTime * uHullSpeed * 0.8));
+        float contact = (1.0 - smoothstep(0.02, width, max(0.0, gap)))
+          * smoothstep(0.26, 0.74, froth) * speed * (0.45 + 0.55 * bow);
+        foam = max(foam, contact);
+      }
+    }
+` : ''}
 
     // Foam is matte and lit like cloth: sun lambert plus sky ambient.
     float lam = max(0.0, dot(n, sun));
@@ -829,13 +895,15 @@ export function createOcean(waveField, options = {}) {
   let reflection = null;
   let cascade = null;
   let hullMask = null;
-  const HULL_UNIFORMS = ['uHullProfile', 'uHullWorldToLocal', 'uHullBounds', 'uHullTexels'];
+  let shipReflection = null;
+  const SHIP_REFLECTION_UNIFORMS = ['uShipReflection', 'uShipReflectionMatrix', 'uShipReflectionAmount'];
+  const HULL_UNIFORMS = ['uHullProfile', 'uHullWorldToLocal', 'uHullBounds', 'uHullTexels', 'uHullSpeed'];
 
   function adoptHullMask(next) {
     for (const key of HULL_UNIFORMS) delete uniforms[key];
     hullMask = next ?? null;
     if (hullMask) {
-      for (const key of HULL_UNIFORMS) uniforms[key] = hullMask.uniforms[key];
+      for (const key of HULL_UNIFORMS) uniforms[key] = hullMask.uniforms[key] ?? { value: 0 };
     }
   }
 
@@ -877,6 +945,7 @@ export function createOcean(waveField, options = {}) {
         reflection: reflection !== null,
         cascade: cascade !== null,
         hullMask: hullMask !== null,
+        shipReflection: shipReflection !== null,
       }),
       uniforms,
       // The tone curve is applied in the shader, on the assembled scene value.
@@ -975,6 +1044,16 @@ export function createOcean(waveField, options = {}) {
     },
 
     setLighting,
+
+    setShipReflection(next) {
+      const had = shipReflection !== null;
+      shipReflection = next ?? null;
+      for (const key of SHIP_REFLECTION_UNIFORMS) {
+        if (shipReflection) uniforms[key] = shipReflection.uniforms[key];
+        else delete uniforms[key];
+      }
+      if (had !== (shipReflection !== null)) rebuild();
+    },
 
     /** Exclude a ship's closed interior without changing the wave field or its
      *  geometry. The host owns the profile texture and updates the inverse world
