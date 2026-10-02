@@ -99,11 +99,45 @@ const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
  * the last of these is what the foam noise is anchored to, because sampling
  * noise at the *displaced* position would make the lace crawl with the orbit.
  */
-const vertexShader = (waveCount, detailCount) => /* glsl */ `
+const vertexShader = (waveCount, detailCount, hullMask = false) => /* glsl */ `
   ${oceanVertexChunk(waveCount)}
 ${detailCount > 0 ? detailVertexChunk(detailCount) : ''}
   uniform vec3 uCameraPos;
 ${detailCount > 0 ? '  uniform float uDetail;' : ''}
+${hullMask ? `
+  uniform sampler2D uHullProfile;
+  uniform mat4 uHullWorldToLocal;
+  uniform vec3 uHullBounds;
+  uniform vec2 uHullTexels;
+  uniform float uHullSpeed;
+  // A small rendering-scale bow wave, bounded to 24 cm. The offshore wave
+  // field remains the authority for seakeeping; this is local displaced water.
+  float shipWave(vec3 world) {
+    float speed = smoothstep(0.6, 7.0, abs(uHullSpeed));
+    if (speed < 0.001) return 0.0;
+    vec3 p = (uHullWorldToLocal * vec4(world, 1.0)).xyz;
+    float len = uHullBounds.y - uHullBounds.x;
+    float along = p.z - uHullBounds.x;
+    if (along < 0.0 || along > len + 90.0 || abs(p.x) > 42.0) return 0.0;
+    float bow = 0.0;
+    if (along < len * 0.48) {
+      float s = (0.5 + along / len * (uHullTexels.x - 1.0)) / uHullTexels.x;
+      vec3 section = texture2D(uHullProfile, vec2(s, 0.5)).rgb;
+      float v = (p.y - section.g) / max(0.01, section.b - section.g);
+      if (v > 0.0 && v < 1.0) {
+        float t = (0.5 + v * (uHullTexels.y - 1.0)) / uHullTexels.y;
+        float gap = abs(p.x) - texture2D(uHullProfile, vec2(s, t)).r;
+        bow = exp(-pow((gap - 0.4) / 0.85, 2.0))
+          * smoothstep(0.0, 2.5, along) * (1.0 - smoothstep(len*0.12,len*0.48,along));
+      }
+    }
+    float aft = max(0.0, p.z - uHullBounds.y);
+    float spread = 0.9 + aft * 0.34;
+    float wake = exp(-pow((abs(p.x)-spread) / (0.8+aft*0.022),2.0))
+      * smoothstep(0.0, 4.0, aft) * exp(-aft/36.0);
+    return speed * speed * (bow * 0.24 + wake * 0.11);
+  }
+` : ''}
 
   varying vec3 vNormal;
   varying vec3 vWorldPos;
@@ -128,6 +162,13 @@ ${detailCount > 0 ? `
     vec3 chopSlope;
     displaced += detailDisplace(p, camDist, uTime, chopSlope) * uDetail;
     n = normalize(n + chopSlope * uDetail);
+` : ''}
+${hullMask ? `
+    float sw = shipWave(displaced);
+    float sx = (shipWave(displaced + vec3(0.3,0.0,0.0)) - sw) / 0.3;
+    float sz = (shipWave(displaced + vec3(0.0,0.0,0.3)) - sw) / 0.3;
+    displaced.y += sw;
+    n = normalize(n + vec3(-sx,0.0,-sz));
 ` : ''}
     vNormal = n;
     vWorldPos = displaced;
@@ -633,6 +674,18 @@ ${features.hullMask ? `
         foam = max(foam, contact);
       }
     }
+    // The diverging stern wave is broken into short moving filaments. The foam
+    // field still remembers the ship's curved track after she changes course.
+    float astern = hp.z - uHullBounds.y;
+    if (astern > 0.0 && astern < 100.0) {
+      float spread = 0.9 + astern * 0.34;
+      float ribbon = exp(-pow((abs(hp.x)-spread)/(0.38+astern*0.012),2.0));
+      float lace = fbm(vec2(hp.x*2.6, hp.z*2.0-uTime*max(0.0,uHullSpeed)));
+      float wakeFoam = ribbon * smoothstep(0.31,0.72,lace)
+        * smoothstep(0.4,6.0,abs(uHullSpeed)) * exp(-astern/48.0)
+        * smoothstep(0.0,3.0,astern) * 0.64;
+      foam = max(foam,wakeFoam);
+    }
 ` : ''}
 
     // Foam is matte and lit like cloth: sun lambert plus sky ambient.
@@ -939,7 +992,7 @@ export function createOcean(waveField, options = {}) {
 
   const makeMaterial = () =>
     new THREE.ShaderMaterial({
-      vertexShader: vertexShader(waveCount, detailCount),
+      vertexShader: vertexShader(waveCount, detailCount, hullMask !== null),
       fragmentShader: fragmentShader(waveCount, normalRange, detailCount, {
         foamField: foamField !== null,
         reflection: reflection !== null,
