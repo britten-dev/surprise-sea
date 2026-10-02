@@ -674,16 +674,17 @@ ${features.hullMask ? `
         foam = max(foam, contact);
       }
     }
-    // The diverging stern wave is broken into short moving filaments. The foam
-    // field still remembers the ship's curved track after she changes course.
+    // Only the fresh, broken water immediately under the counter follows the hull.
+    // The foam field carries the older wake along her actual track. Long analytical
+    // ribbons here made two ruler-straight white lines which swivelled with her.
     float astern = hp.z - uHullBounds.y;
-    if (astern > 0.0 && astern < 100.0) {
-      float spread = 0.9 + astern * 0.34;
-      float ribbon = exp(-pow((abs(hp.x)-spread)/(0.38+astern*0.012),2.0));
-      float lace = fbm(vec2(hp.x*2.6, hp.z*2.0-uTime*max(0.0,uHullSpeed)));
-      float wakeFoam = ribbon * smoothstep(0.31,0.72,lace)
-        * smoothstep(0.4,6.0,abs(uHullSpeed)) * exp(-astern/48.0)
-        * smoothstep(0.0,3.0,astern) * 0.64;
+    if (astern > 0.0 && astern < 12.0) {
+      float lace = fbm(vUndisp * 1.8 - uWindDir * uTime * 0.35);
+      float width = 0.65 + astern * 0.15;
+      float churn = exp(-pow((hp.x + (lace-0.5)*1.4)/width,2.0));
+      float wakeFoam = churn * smoothstep(0.43,0.76,lace)
+        * smoothstep(0.8,6.0,abs(uHullSpeed))
+        * smoothstep(0.0,1.2,astern) * (1.0-smoothstep(4.0,12.0,astern)) * 0.32;
       foam = max(foam,wakeFoam);
     }
 ` : ''}
