@@ -244,6 +244,25 @@ const fragmentShader = (waveCount, normalRange, detailCount, features = {}) => /
   uniform vec2 uWindDir;
   uniform float uTime;
 
+${features.hullMask ? `
+  uniform sampler2D uHullProfile;
+  uniform mat4 uHullWorldToLocal;
+  uniform vec3 uHullBounds; // forward z, aft z, maximum half-breadth
+  uniform vec2 uHullTexels;
+
+  bool insideHull(vec3 worldPosition) {
+    vec3 p = (uHullWorldToLocal * vec4(worldPosition, 1.0)).xyz;
+    if (p.z <= uHullBounds.x || p.z >= uHullBounds.y || abs(p.x) >= uHullBounds.z) return false;
+    float u = (p.z - uHullBounds.x) / (uHullBounds.y - uHullBounds.x);
+    float s = (0.5 + u * (uHullTexels.x - 1.0)) / uHullTexels.x;
+    vec3 section = texture2D(uHullProfile, vec2(s, 0.5)).rgb;
+    if (p.y <= section.g || p.y >= section.b) return false;
+    float v = (p.y - section.g) / (section.b - section.g);
+    float t = (0.5 + v * (uHullTexels.y - 1.0)) / uHullTexels.y;
+    float breadth = texture2D(uHullProfile, vec2(s, t)).r;
+    return abs(p.x) < breadth;
+  }
+` : ''}
   // Everything the sea state decides. Heights are in metres; the foam
   // thresholds are in the same units as the Gerstner pinch the vertex stage
   // hands over, so they mean the same thing in a millpond and in a survival sea.
@@ -304,6 +323,7 @@ ${detailCount > 0 ? `  // The same octave folded about its own middle, which tur
   }` : ''}
 
   void main() {
+${features.hullMask ? '    if (insideHull(vWorldPos)) discard;' : ''}
     vec3 viewDir = normalize(uCameraPos - vWorldPos);
     float dist = distance(uCameraPos, vWorldPos);
     vec3 sun = normalize(uSunDir);
@@ -808,6 +828,16 @@ export function createOcean(waveField, options = {}) {
   let foamField = null;
   let reflection = null;
   let cascade = null;
+  let hullMask = null;
+  const HULL_UNIFORMS = ['uHullProfile', 'uHullWorldToLocal', 'uHullBounds', 'uHullTexels'];
+
+  function adoptHullMask(next) {
+    for (const key of HULL_UNIFORMS) delete uniforms[key];
+    hullMask = next ?? null;
+    if (hullMask) {
+      for (const key of HULL_UNIFORMS) uniforms[key] = hullMask.uniforms[key];
+    }
+  }
 
   /** Adopt the field's own uniform objects: it ping-pongs its render targets
    *  every update, and this is what saves the sea from being told about it. */
@@ -846,6 +876,7 @@ export function createOcean(waveField, options = {}) {
         foamField: foamField !== null,
         reflection: reflection !== null,
         cascade: cascade !== null,
+        hullMask: hullMask !== null,
       }),
       uniforms,
       // The tone curve is applied in the shader, on the assembled scene value.
@@ -944,6 +975,18 @@ export function createOcean(waveField, options = {}) {
     },
 
     setLighting,
+
+    /** Exclude a ship's closed interior without changing the wave field or its
+     *  geometry. The host owns the profile texture and updates the inverse world
+     *  matrix after moving its ship. Removing the mask compiles out its cost.
+     *  Profile RGB: half-breadth, bottom height, rail height in ship-local metres.
+     *  Columns run forward to aft; rows run bottom to rail at each station.
+     *  Only the interior is hidden: overtopping above the rail remains visible. */
+    setHullMask(maskOrNull) {
+      const had = hullMask !== null;
+      adoptHullMask(maskOrNull);
+      if (had !== (hullMask !== null)) rebuild();
+    },
 
     /**
      * How much of the near-field treatment to run, 0..1.
