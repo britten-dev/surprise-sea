@@ -194,8 +194,10 @@ export class Hull {
    * @param field   a WaveField, already advanced for this frame.
    * @param rudder  −1..1, port to starboard.
    * @param thrust  0..1, the fraction of maxSpeed her canvas is driving her at.
+   * @param heel    equilibrium heel from external loading, radians, positive starboard.
+   *                Defaults to zero for hosts that only simulate waves.
    */
-  update(dt, field, { rudder = 0, thrust = 0 } = {}) {
+  update(dt, field, { rudder = 0, thrust = 0, heel = 0 } = {}) {
     if (!(dt > 0) || !field) return this;
 
     const o = this.options;
@@ -230,7 +232,11 @@ export class Hull {
 
     const targetHeave = (hBow + hStern + hPort + hStar) / 4;
     const targetPitch = Math.atan2(hBow - hStern, foreSpan) * o.pitchGain;
-    let targetRoll = Math.atan2(hPort - hStar, beamSpan) * o.rollGain;
+    // Wind loading belongs to the host's sail model. Combine its equilibrium
+    // angle with the wave slope before inertia, so rendering, deck immersion,
+    // broach recovery and every other hull consumer see the same attitude.
+    let targetRoll = Math.atan2(hPort - hStar, beamSpan) * o.rollGain
+      + (Number.isFinite(heel) ? heel : 0);
 
     // --- 2. Surge, and how hard she is surfing ------------------------------
     // Stern up means she is on the face of a wave that is overtaking her, and

@@ -141,6 +141,7 @@ const hull = new Hull({
 hull.update(dt, waveField, {
   rudder,      // -1..1, port..starboard
   thrust,      // 0..1 fraction of maxSpeed the canvas is driving her at
+  heel: 0,    // optional equilibrium load angle, radians, positive starboard
 });
 ```
 
@@ -148,7 +149,10 @@ Model, per update:
 
 1. Sample `heightAt` at bow, stern, port beam, starboard beam (at ±length·0.35
    and ±beam·0.45). Targets: heave = mean; pitch = atan(bow−stern / span)·0.85;
-   roll = atan(port−starboard / span)·0.6. Ease each toward its target with
+   roll = atan(port−starboard / span)·0.6 + heel. A host may supply the equilibrium
+   heel from its sail loading model (zero by default). This is combined before
+   smoothing and transform generation, so deck immersion and rendering share
+   the same attitude. Ease each toward its target with
    its tau (`1 − exp(−dt/τ)`).
 2. **Surge/surf**: fore-aft slope under her; stern-up adds speed (surf),
    bow-up subtracts. `surfFactor` 0..1 = how hard she is surfing.
