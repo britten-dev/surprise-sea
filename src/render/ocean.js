@@ -52,6 +52,7 @@ import * as THREE from 'three';
 import { waveUniforms, oceanVertexChunk, oceanNormalChunk } from '../seastate.js';
 import { warpedGrid } from './grid.js';
 import { cascadeSamplingChunk } from './cascade-sampling.js';
+import { hullWaveChunk, hullWashChunk } from './hull-flow.js';
 import {
   DETAIL_COUNT,
   detailTable,
@@ -111,33 +112,7 @@ ${hullMask ? `
   uniform vec3 uHullBounds;
   uniform vec2 uHullTexels;
   uniform float uHullSpeed;
-  // A small rendering-scale bow wave, bounded to 24 cm. The offshore wave
-  // field remains the authority for seakeeping; this is local displaced water.
-  float shipWave(vec3 world) {
-    float speed = smoothstep(0.6, 7.0, abs(uHullSpeed));
-    if (speed < 0.001) return 0.0;
-    vec3 p = (uHullWorldToLocal * vec4(world, 1.0)).xyz;
-    float len = uHullBounds.y - uHullBounds.x;
-    float along = p.z - uHullBounds.x;
-    if (along < 0.0 || along > len + 90.0 || abs(p.x) > 42.0) return 0.0;
-    float bow = 0.0;
-    if (along < len * 0.48) {
-      float s = (0.5 + along / len * (uHullTexels.x - 1.0)) / uHullTexels.x;
-      vec3 section = texture2D(uHullProfile, vec2(s, 0.5)).rgb;
-      float v = (p.y - section.g) / max(0.01, section.b - section.g);
-      if (v > 0.0 && v < 1.0) {
-        float t = (0.5 + v * (uHullTexels.y - 1.0)) / uHullTexels.y;
-        float gap = abs(p.x) - texture2D(uHullProfile, vec2(s, t)).r;
-        bow = exp(-pow((gap - 0.4) / 0.85, 2.0))
-          * smoothstep(0.0, 2.5, along) * (1.0 - smoothstep(len*0.12,len*0.48,along));
-      }
-    }
-    float aft = max(0.0, p.z - uHullBounds.y);
-    float spread = 0.9 + aft * 0.34;
-    float wake = exp(-pow((abs(p.x)-spread) / (0.8+aft*0.022),2.0))
-      * smoothstep(0.0, 4.0, aft) * exp(-aft/36.0);
-    return speed * speed * (bow * 0.24 + wake * 0.11);
-  }
+  ${hullWaveChunk}
 ` : ''}
 
   varying vec3 vNormal;
@@ -320,6 +295,8 @@ ${features.hullMask ? `
   uniform vec3 uHullBounds; // forward z, aft z, maximum half-breadth
   uniform vec2 uHullTexels;
   uniform float uHullSpeed;
+  uniform float uHullTravel;
+  ${hullWaveChunk}
 
   bool insideHull(vec3 worldPosition) {
     vec3 p = (uHullWorldToLocal * vec4(worldPosition, 1.0)).xyz;
@@ -391,6 +368,7 @@ ${features.foamField ? `
   float fbm(vec2 p) {
     return noise(p) * 0.65 + noise(p * 2.7) * 0.35;
   }
+${features.hullMask ? hullWashChunk : ''}
 ${detailCount > 0 ? `  // The same octave folded about its own middle, which turns blobs into veins
   // for the price of an abs(). Foam close to does not lie on the water in
   // patches: it lies in lace, thick along the folds and thin between them.
@@ -399,7 +377,7 @@ ${detailCount > 0 ? `  // The same octave folded about its own middle, which tur
   }` : ''}
 
   void main() {
-${features.hullMask ? '    if (insideHull(vWorldPos)) discard;' : ''}
+${features.hullMask ? '    bool hullInterior = insideHull(vWorldPos);' : ''}
     vec3 viewDir = normalize(uCameraPos - vWorldPos);
     float dist = distance(uCameraPos, vWorldPos);
     vec3 sun = normalize(uSunDir);
@@ -470,6 +448,40 @@ ${features.cascade ? `    // And down again wherever the cascade is running. The
       n = normalize(n + vec3(gx, 0.0, gz) * rippleAmt);
     }
 
+${features.hullMask ? `
+    vec3 hp = (uHullWorldToLocal * vec4(vWorldPos, 1.0)).xyz;
+    float hu = (hp.z - uHullBounds.x) / (uHullBounds.y - uHullBounds.x);
+    vec2 flowFootprint = hp.xz * vec2(3.0, 0.48);
+    float flowPixel = max(length(dFdx(flowFootprint)), length(dFdy(flowFootprint)));
+    vec3 hullWashValues = vec3(0.0);
+    float hullRelief = 0.0;
+    if (hu > 0.0 && hu < 1.0 && abs(hp.x) < uHullBounds.z + 4.0) {
+      float hs = (0.5 + hu * (uHullTexels.x - 1.0)) / uHullTexels.x;
+      vec3 section = texture2D(uHullProfile, vec2(hs, 0.5)).rgb;
+      float hv = (hp.y - section.g) / max(0.01, section.b - section.g);
+      if (hv > 0.0 && hv < 1.0) {
+        float ht = (0.5 + hv * (uHullTexels.y - 1.0)) / uHullTexels.y;
+        float gap = abs(hp.x) - texture2D(uHullProfile, vec2(hs, ht)).r;
+        hullWashValues = hullWash(hp, gap, hu, flowPixel);
+      }
+      // Per-pixel sea normals previously replaced the entire vertex normal,
+      // losing the bow wave. Restore that relief alongside the flowing wash.
+      hullRelief = shipWave(vWorldPos) * nearAmt + hullWashValues.z;
+    }
+    // Screen derivatives give a world-space height gradient without resampling
+    // either noise or the hull profile. Evaluate outside the conditional so
+    // neighbouring fragments agree at the edge of the affected water.
+    vec3 dx = dFdx(vWorldPos), dy = dFdy(vWorldPos);
+    float det = dx.x * dy.z - dx.z * dy.x;
+    vec2 dh = vec2(dFdx(hullRelief), dFdy(hullRelief));
+    if (abs(det) > 0.0000001) {
+      vec2 slope = vec2(dh.x * dy.z - dh.y * dx.z, dh.y * dx.x - dh.x * dy.x) / det;
+      n = normalize(n + vec3(-slope.x, 0.0, -slope.y));
+    }
+` : ''}
+
+${features.hullMask ? '    if (hullInterior) discard;' : ''}
+
     // --- Water body ---------------------------------------------------------
     // Looking down into it: near-black green. Grazing: it vanishes behind the
     // reflected sky. That switch is most of what the eye uses.
@@ -479,6 +491,11 @@ ${features.cascade ? `    // And down again wherever the cascade is running. The
     float fresnel = 0.02 + 0.5 * pow(1.0 - facing, 5.0);
 
     vec3 water = uDeep;
+${features.hullMask ? `
+    // Bubbles below the surface soften the green water before they become
+    // white surface foam. They still receive its reflections and highlights.
+    water = mix(water, uCrestGlow * 1.3, hullWashValues.y);
+` : ''}
 
     // Transmission: light that went in the back of a crest and came out this
     // side, which is what the bottle-green actually is. Four things have to be
@@ -633,28 +650,7 @@ ${detailCount > 0 ? `
 
     float foam = clamp(crestFoam + streaks, 0.0, 1.0);
 ${features.hullMask ? `
-    // Sample the hull at the height of this water fragment: foam stays at contact.
-    vec3 hp = (uHullWorldToLocal * vec4(vWorldPos, 1.0)).xyz;
-    float hu = (hp.z - uHullBounds.x) / (uHullBounds.y - uHullBounds.x);
-    if (hu > 0.0 && hu < 1.0 && abs(hp.x) < uHullBounds.z + 2.5) {
-      float hs = (0.5 + hu * (uHullTexels.x - 1.0)) / uHullTexels.x;
-      vec3 section = texture2D(uHullProfile, vec2(hs, 0.5)).rgb;
-      float hv = (hp.y - section.g) / (section.b - section.g);
-      if (hv > 0.0 && hv < 1.0) {
-        float ht = (0.5 + hv * (uHullTexels.y - 1.0)) / uHullTexels.y;
-        float gap = abs(hp.x) - texture2D(uHullProfile, vec2(hs, ht)).r;
-        float speed = smoothstep(0.3, 6.0, abs(uHullSpeed));
-        float bow = 1.0 - smoothstep(0.05, 0.38, hu);
-        float width = 0.16 + speed * (0.30 + bow * 0.9);
-        // Anchor the froth to the water, so acceleration cannot reset its phase.
-        // time * current speed jumps by time * deltaSpeed every frame: after a
-        // long watch even a tiny speed change made the whole waterline flash.
-        float froth = fbm(vUndisp * 2.4 - uWindDir * uTime * 0.6);
-        float contact = (1.0 - smoothstep(0.02, width, max(0.0, gap)))
-          * smoothstep(0.26, 0.74, froth) * speed * (0.45 + 0.55 * bow);
-        foam = max(foam, contact);
-      }
-    }
+    foam = max(foam, hullWashValues.x);
 ${!features.foamField ? `
     // Lightweight fallback when there is no persistent wake field (phones).
     // Detailed water already records the ship's churn; adding a second bright
@@ -934,7 +930,7 @@ export function createOcean(waveField, options = {}) {
   let hullMask = null;
   let shipReflection = null;
   const SHIP_REFLECTION_UNIFORMS = ['uShipReflection', 'uShipReflectionMatrix', 'uShipReflectionAmount'];
-  const HULL_UNIFORMS = ['uHullProfile', 'uHullWorldToLocal', 'uHullBounds', 'uHullTexels', 'uHullSpeed'];
+  const HULL_UNIFORMS = ['uHullProfile', 'uHullWorldToLocal', 'uHullBounds', 'uHullTexels', 'uHullSpeed', 'uHullTravel'];
 
   function adoptHullMask(next) {
     for (const key of HULL_UNIFORMS) delete uniforms[key];
@@ -1097,6 +1093,8 @@ export function createOcean(waveField, options = {}) {
      *  matrix after moving its ship. Removing the mask compiles out its cost.
      *  Profile RGB: half-breadth, bottom height, rail height in ship-local metres.
      *  Columns run forward to aft; rows run bottom to rail at each station.
+     *  uHullTravel is signed integrated forward travel, in metres: add speed*dt
+     *  once per simulation tick for continuous aft-flowing waterline streaks.
      *  Only the interior is hidden: overtopping above the rail remains visible. */
     setHullMask(maskOrNull) {
       const had = hullMask !== null;
