@@ -349,6 +349,19 @@ ${features.foamField ? `
   uniform float uCascadeFar;      // metres at which the tile has faded out
   ${cascadeSamplingChunk}
 ` : ''}
+${features.hullTransmission ? `
+  uniform sampler2D uHullColour;
+  uniform sampler2D uHullDepth;
+  uniform mat4 uHullProjection;
+  uniform mat4 uHullView;
+  uniform vec2 uHullCameraRange;
+  uniform float uHullTransmissionAmount;
+
+  float hullEyeDepth(float depth) {
+    float near = uHullCameraRange.x, far = uHullCameraRange.y;
+    return near * far / (far + depth * (near - far));
+  }
+` : ''}
   varying vec3 vNormal;
   varying vec3 vWorldPos;
   varying float vCrest;
@@ -579,6 +592,41 @@ ${features.shipReflection ? `
         float edge = smoothstep(0.0, 0.04, min(min(ruv.x, ruv.y), min(1.0 - ruv.x, 1.0 - ruv.y)));
         skyCol = mix(skyCol, reflected.rgb / max(reflected.a, 0.001),
           reflected.a * uShipReflectionAmount * edge * exp(-dist / 350.0));
+      }
+    }
+` : ''}
+${features.hullTransmission ? `
+    // A wave must hide the hull gradually with optical depth, not slice it off
+    // like an opaque sheet. The capture contains the body only, no sky or sails.
+    if (uHullTransmissionAmount > 0.0) {
+      vec4 clip = uHullProjection * vec4(vWorldPos, 1.0);
+      vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+      if (clip.w > 0.0 && all(greaterThan(uv, vec2(0.002))) && all(lessThan(uv, vec2(0.998)))) {
+        float depth = texture2D(uHullDepth, uv).r;
+        float thickness = hullEyeDepth(depth) - clip.w;
+        if (depth < 0.999999 && thickness >= 0.0 && thickness < 6.0) {
+          // At the contact itself the image must meet the actual planking.
+          // Refraction grows only after the ray has travelled through water.
+          vec3 eyeNormal = (uHullView * vec4(n, 0.0)).xyz;
+          vec2 bentUV = uv + eyeNormal.xy * 0.003 * smoothstep(0.0, 1.5, thickness);
+          float bentDepth = texture2D(uHullDepth, bentUV).r;
+          float bentThickness = hullEyeDepth(bentDepth) - clip.w;
+          if (bentDepth < 0.999999 && bentThickness >= 0.0 && abs(bentThickness - thickness) < 0.5) {
+            uv = bentUV; thickness = bentThickness;
+          }
+          vec4 body = texture2D(uHullColour, uv);
+          // Convert view-axis depth into distance along the view ray. Red is
+          // absorbed fastest; the first submerged planks remain green and dim.
+          float path = thickness * dist / max(clip.w, 0.001);
+          vec3 transmission = exp(-vec3(1.65, 0.8, 0.62) * path);
+          vec3 submerged = body.rgb / max(body.a, 0.001) * transmission
+            + water * (1.0 - transmission);
+          float edge = smoothstep(0.0, 0.008, min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y)));
+          // Lose the last distant glimmer gradually, before the finite capture
+          // range ends. Nothing may pop into view at the far depth cutoff.
+          float visibility = 1.0 - smoothstep(1.5, 4.5, path);
+          water = mix(water, submerged, body.a * edge * visibility * uHullTransmissionAmount * 0.94);
+        }
       }
     }
 ` : ''}
@@ -929,6 +977,10 @@ export function createOcean(waveField, options = {}) {
   let cascade = null;
   let hullMask = null;
   let shipReflection = null;
+  let hullTransmission = null;
+  const TRANSMISSION_UNIFORMS = [
+    'uHullColour', 'uHullDepth', 'uHullProjection', 'uHullView', 'uHullCameraRange', 'uHullTransmissionAmount',
+  ];
   const SHIP_REFLECTION_UNIFORMS = ['uShipReflection', 'uShipReflectionMatrix', 'uShipReflectionAmount'];
   const HULL_UNIFORMS = ['uHullProfile', 'uHullWorldToLocal', 'uHullBounds', 'uHullTexels', 'uHullSpeed', 'uHullTravel'];
 
@@ -979,6 +1031,7 @@ export function createOcean(waveField, options = {}) {
         cascade: cascade !== null,
         hullMask: hullMask !== null,
         shipReflection: shipReflection !== null,
+        hullTransmission: hullTransmission !== null,
       }),
       uniforms,
       // The tone curve is applied in the shader, on the assembled scene value.
@@ -1077,6 +1130,18 @@ export function createOcean(waveField, options = {}) {
     },
 
     setLighting,
+
+    /** Linear-light colour and depth of the ship body from the active camera.
+     *  Optional: removing the capture compiles out both samplers and all work. */
+    setHullTransmission(next) {
+      const had = hullTransmission !== null;
+      hullTransmission = next ?? null;
+      for (const key of TRANSMISSION_UNIFORMS) {
+        if (hullTransmission) uniforms[key] = hullTransmission.uniforms[key];
+        else delete uniforms[key];
+      }
+      if (had !== (hullTransmission !== null)) rebuild();
+    },
 
     setShipReflection(next) {
       const had = shipReflection !== null;
