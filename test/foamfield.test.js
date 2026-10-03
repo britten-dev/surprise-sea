@@ -440,6 +440,56 @@ test('nothing under a knot or two', () => {
   assert.ok(foam.stamps.length > 0, 'she never picked the trail back up');
 });
 
+test('developing wake builds gradually at the same rate at 30, 60 and 120 Hz', () => {
+  const atHalfAge = [];
+  for (const hz of [30, 60, 120]) {
+    const { hull, foam, wake } = shipRig('calm', 0, {
+      jitter: 0, fadeIn: 0.6, spacingFactor: 0.1,
+    });
+    hull.speed = 6;
+    wake.update(1 / hz);
+    const spacing = hull.options.beam * 0.1;
+    const birth = spacing / hull.speed;
+    const strengths = [];
+    for (let frame = 1; frame <= hz; frame++) {
+      hull.position.z = -frame * hull.speed / hz;
+      foam.stamps.length = 0;
+      wake.update(1 / hz);
+      const first = foam.stamps.find(s => Math.abs(s.z - (hull.options.length / 2 - spacing)) < 1e-6);
+      if (first) strengths.push({ time: frame / hz - birth, strength: first.strength });
+    }
+    assert.ok(strengths.length > hz * 0.5, 'churn should develop over time');
+    assert.ok(strengths[0].strength < 0.01, 'the first frame flashed at full strength');
+    for (let i = 1; i < strengths.length; i++) {
+      assert.ok(strengths[i].strength >= strengths[i - 1].strength);
+      assert.ok(strengths[i].strength - strengths[i - 1].strength < 0.09,
+        'a developing patch jumped in brightness');
+    }
+    const half = strengths.reduce((a, b) => Math.abs(a.time - 0.3) < Math.abs(b.time - 0.3) ? a : b);
+    atHalfAge.push(half.strength);
+  }
+  assert.ok(Math.max(...atHalfAge) - Math.min(...atHalfAge) < 0.04);
+});
+
+test('wake reset or teleport clears developing patches; slowing lets them finish', () => {
+  for (const action of ['reset', 'teleport', 'slow']) {
+    const { hull, foam, wake } = shipRig('calm', 0, { jitter: 0, fadeIn: 0.6, spacingFactor: 0.1 });
+    hull.speed = 6;
+    wake.update(1 / 60);
+    for (let i = 0; i < 15; i++) { hull.position.z -= 0.1; wake.update(1 / 60); }
+    foam.stamps.length = 0;
+    if (action === 'reset') wake.reset();
+    if (action === 'teleport') hull.position.z -= 1000;
+    if (action === 'slow') hull.speed = 0;
+    wake.update(1 / 60);
+    assert.equal(foam.stamps.length > 0, action === 'slow');
+    for (let i = 0; i < 60; i++) wake.update(1 / 60);
+    foam.stamps.length = 0;
+    wake.update(1 / 60);
+    assert.equal(foam.stamps.length, 0, 'finished patches must leave no ongoing emitter');
+  }
+});
+
 test('the trail doubles in width while she is over', () => {
   const upright = shipRig();
   upright.hull.speed = 5;

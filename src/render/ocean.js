@@ -668,7 +668,10 @@ ${features.hullMask ? `
         float speed = smoothstep(0.3, 6.0, abs(uHullSpeed));
         float bow = 1.0 - smoothstep(0.05, 0.38, hu);
         float width = 0.16 + speed * (0.30 + bow * 0.9);
-        float froth = fbm(vec2(hp.x * 4.0, hp.z * 1.6 - uTime * uHullSpeed * 0.8));
+        // Anchor the froth to the water, so acceleration cannot reset its phase.
+        // time * current speed jumps by time * deltaSpeed every frame: after a
+        // long watch even a tiny speed change made the whole waterline flash.
+        float froth = fbm(vUndisp * 2.4 - uWindDir * uTime * 0.6);
         float contact = (1.0 - smoothstep(0.02, width, max(0.0, gap)))
           * smoothstep(0.26, 0.74, froth) * speed * (0.45 + 0.55 * bow);
         foam = max(foam, contact);

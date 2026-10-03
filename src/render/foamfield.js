@@ -634,6 +634,7 @@ const WAKE_DEFAULTS = {
   widthFactor: 0.9, // stamp radius as a fraction of her beam
   spacingFactor: 0.5, // distance between splats, likewise
   strength: 0.85, // coverage laid down at full speed
+  fadeIn: 0, // seconds for fresh churn to develop; 0 preserves immediate stamping
   broachWidth: 2, // the trail doubles in width while she is over
   broachRadius: 3.5, // beams. A broach leaves an enormous scar — free drama.
   broachStrength: 1,
@@ -682,6 +683,20 @@ export function wakeStamper(hull, foam, options = {}) {
   let prevZ = null;
   let carry = 0;
   let wasBroached = false;
+  const developing = [];
+
+  // A new patch of churn should gather whiteness rather than appear at full
+  // strength for one frame and immediately diffuse away. Positions stay in the
+  // water along the sailed track, including while the ship slows or turns.
+  function develop() {
+    for (let i = developing.length - 1; i >= 0; i--) {
+      const s = developing[i];
+      const t = clamp(s.age / o.fadeIn, 0, 1);
+      foam.stamp(s.x, s.z, s.radius, s.strength * t * t * (3 - 2 * t));
+      if (t >= 1) developing.splice(i, 1);
+    }
+    return stats;
+  }
 
   // The library's LCG, one private stream per stamper: churn is not pattern.
   let rngState = ((o.seed ^ 0x9e3779b9) >>> 0) || 1;
@@ -708,6 +723,8 @@ export function wakeStamper(hull, foam, options = {}) {
      */
     update(dt = 0) {
       if (!hull || !foam) return stats;
+      const step = clamp(Number.isFinite(dt) ? dt : 0, 0, MAX_STEP);
+      for (const s of developing) s.age += step;
 
       const speed = hull.speed ?? 0;
       const broached = !!hull.broached;
@@ -734,7 +751,7 @@ export function wakeStamper(hull, foam, options = {}) {
       if (prevX === null) {
         prevX = x;
         prevZ = z;
-        return stats;
+        return develop();
       }
 
       const dx = x - prevX;
@@ -750,6 +767,7 @@ export function wakeStamper(hull, foam, options = {}) {
         prevX = x;
         prevZ = z;
         carry = 0;
+        developing.length = 0;
         return stats;
       }
 
@@ -760,7 +778,7 @@ export function wakeStamper(hull, foam, options = {}) {
         prevX = x;
         prevZ = z;
         carry = 0;
-        return stats;
+        return develop();
       }
 
       const over = clamp(
@@ -785,12 +803,15 @@ export function wakeStamper(hull, foam, options = {}) {
         const lat = (rand() * 2 - 1) * radius * 0.5 * o.jitter;
         const rf = 1 + (rand() * 2 - 1) * 0.35 * o.jitter;
         const sf = 1 - rand() * 0.5 * o.jitter;
-        foam.stamp(
-          prevX + ux * along - uz * lat,
-          prevZ + uz * along + ux * lat,
-          radius * rf,
-          strength * sf
-        );
+        const sx = prevX + ux * along - uz * lat;
+        const sz = prevZ + uz * along + ux * lat;
+        if (o.fadeIn > 0 && step > 0) {
+          // Account for where in this step the ship crossed the stamp position.
+          developing.push({ x: sx, z: sz, radius: radius * rf, strength: strength * sf,
+            age: step * (moved - along) / moved });
+        } else {
+          foam.stamp(sx, sz, radius * rf, strength * sf);
+        }
         laid++;
         along += spacing;
       }
@@ -805,7 +826,7 @@ export function wakeStamper(hull, foam, options = {}) {
 
       prevX = x;
       prevZ = z;
-      return stats;
+      return develop();
     },
 
     /** Forget the track. For a game that has moved her deliberately. */
@@ -814,6 +835,7 @@ export function wakeStamper(hull, foam, options = {}) {
       prevZ = null;
       carry = 0;
       wasBroached = !!hull?.broached;
+      developing.length = 0;
     },
   };
 }
