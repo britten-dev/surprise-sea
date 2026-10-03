@@ -149,6 +149,15 @@ test('stamps queue cheaply and are dropped rather than piling up', () => {
   assert.equal(foam.stats.dropped, 6, 'an empty stamp was queued or counted');
 });
 
+test('clearing an inactive field drops both old history and queued stamps', () => {
+  const {foam}=rig(),renderer=stubRenderer();
+  foam.stamp(0,0,5,.6);foam.update(renderer,1/30,{x:0,z:0});
+  foam.stamp(4,0,5,.6);foam.clear();foam.update(renderer,1/30,{x:100,z:100});
+  assert.equal(foam.materials.step.uniforms.uDecay.value,0);
+  assert.equal(foam.stats.stamps,0);
+  foam.dispose();
+});
+
 test('a field with no renderer is a no-op, not a crash', () => {
   const { foam } = rig();
   assert.doesNotThrow(() => {

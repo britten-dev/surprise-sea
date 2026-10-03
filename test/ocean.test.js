@@ -294,6 +294,33 @@ test('a texture with amount zero compiles in, so it can be faded up for free', (
   assert.equal(ocean.mesh.material.fragmentShader, src, 'the amount forced a recompile');
 });
 
+test('fine wake history shares its ping-pong uniforms independently of crest memory', () => {
+  const {field,ocean}=rig(),wide=fieldFor(field),wake=createFoamField(field,{size:64,extent:160,inject:0});
+  ocean.setFoamField(wide);
+  const before=ocean.mesh.material.fragmentShader;
+  ocean.setWakeField(wake);
+  assert.equal(ocean.uniforms.uFoamField,wide.uniforms.uFoamField);
+  assert.equal(ocean.uniforms.uWakeField,wake.uniforms.uFoamField);
+  assert.equal(ocean.uniforms.uWakeOrigin,wake.uniforms.uFoamOrigin);
+  wake.uniforms.uFoamField.value='next wake target';
+  assert.equal(ocean.uniforms.uWakeField.value,'next wake target');
+  assertUniformsExact(ocean.mesh.material.fragmentShader,'independent wake and crests');
+  ocean.setWakeField(null);
+  assert.equal(ocean.mesh.material.fragmentShader,before);
+  assert.ok(!('uWakeField' in ocean.uniforms));
+  ocean.dispose();wide.dispose();wake.dispose();
+});
+
+test('wake-only shader and wave-count changes retain a valid independent layer', () => {
+  const {field,ocean}=rig(),wake=createFoamField(field,{size:64,extent:160,inject:0});
+  ocean.setWakeField(wake);
+  ocean.setSeaState(createSeaState({preset:'greybeards',waveCount:17}));
+  assertUniformsExact(ocean.mesh.material.fragmentShader,'wake without crest history');
+  assert.equal(ocean.uniforms.uWakeField,wake.uniforms.uFoamField);
+  assert.ok(!('uFoamField' in ocean.uniforms));
+  ocean.dispose();wake.dispose();
+});
+
 test('a live change of sea keeps whatever layers are switched on', () => {
   const { field, ocean } = rig();
   ocean.setFoamField(fieldFor(field));

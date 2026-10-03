@@ -332,6 +332,12 @@ ${features.foamField ? `
   uniform vec2 uFoamOrigin;    // world xz of the footprint's near corner
   uniform float uFoamInvExtent;
   uniform float uFoamAmount;   // 0 falls back to the analytic foam entirely
+` : ''}${features.wakeField ? `
+  // Fine, ship-centred history, independent of the kilometre-scale crest field.
+  uniform sampler2D uWakeField;
+  uniform vec2 uWakeOrigin;
+  uniform float uWakeInvExtent;
+  uniform float uWakeAmount;
 ` : ''}${features.reflection ? `
   uniform samplerCube uSkyRefl;
   uniform float uSkyReflAmount; // 0 = the procedural ramp, exactly as before
@@ -660,6 +666,20 @@ ${features.hullTransmission ? `
     // water, not as half a coat of paint. Fresh white is still fresh white.
     float ffScar = texture2D(uFoamField, ffUv).r;
     crestFoam = max(crestFoam, ffScar * ffScar * uFoamAmount * ffFade);` : ''}
+${features.wakeField ? `
+    // Wake stamps are recorded at world positions along the sailed track.
+    // Sample displaced positions too, so a passing wave cannot pull a patch
+    // several metres away from the track as it did with the datum footprint.
+    vec2 wfUv = (vWorldPos.xz - uWakeOrigin) * uWakeInvExtent;
+    vec2 wfEdge = min(wfUv, 1.0 - wfUv);
+    float wfFade = smoothstep(0.0, 0.08, min(wfEdge.x, wfEdge.y));
+    float wakeScar = texture2D(uWakeField, wfUv).r * wfFade * uWakeAmount;
+    vec2 wakeGrain = (vWorldPos.xz - uWindDir * uTime * 0.25) * 1.15;
+    float wakePixel = max(length(dFdx(wakeGrain)), length(dFdy(wakeGrain)));
+    float wakeResolved = 1.0 - smoothstep(0.25, 0.8, wakePixel);
+    float wakeTexture = mix(0.65, 0.35 + 0.65 * fbm(wakeGrain), wakeResolved);
+    crestFoam = max(crestFoam, wakeScar * wakeScar * wakeTexture);
+` : ''}
 ${detailCount > 0 ? `
     // Break up the wash gently. High-contrast sub-metre ridges plus a second
     // hard threshold made persistent wake foam flash as a 30 fps chase camera
@@ -699,7 +719,7 @@ ${detailCount > 0 ? `
     float foam = clamp(crestFoam + streaks, 0.0, 1.0);
 ${features.hullMask ? `
     foam = max(foam, hullWashValues.x);
-${!features.foamField ? `
+${!features.foamField && !features.wakeField ? `
     // Lightweight fallback when there is no persistent wake field (phones).
     // Detailed water already records the ship's churn; adding a second bright
     // patch under her counter made unrelated noise flare on and off there.
@@ -762,7 +782,8 @@ ${!features.foamField ? `
       // Squared, then leaned on once more: the storm's minute-old ambient
       // scars sit in the mid tones and made the whole night sea a green
       // field; a fresh wake sits near one and keeps almost everything.
-      churn = max(churn, scar * scar * (0.3 + 0.7 * scar));` : ''}
+      churn = max(churn, scar * scar * (0.3 + 0.7 * scar));` : ''}${features.wakeField ? `
+      churn = max(churn, wakeScar * wakeScar * (0.3 + 0.7 * wakeScar));` : ''}
       // 0.55, down from a first cut of 1.2: at 1.2 a storm burned
       // wall-to-wall and the fire read as stage light. Sea fire is an
       // accent on a dark sea, not the sea.
@@ -876,7 +897,7 @@ function setColour(uniform, value) {
  * @param waveField  a WaveField; its `sea` supplies the spectrum and its `time`
  *                   the clock, so the mesh can never drift out of step with the
  *                   physics reading the same field.
- * @param options    { quality, windFromDeg, fogDensity, lighting, foamField,
+ * @param options    { quality, windFromDeg, fogDensity, lighting, foamField, wakeField,
  *                     cascade, detail }
  *                   quality: { gridN, halfSpan, exponent, normalRange } —
  *                            normalRange also governs the near-field wavelets;
@@ -887,6 +908,8 @@ function setColour(uniform, value) {
  *                               of them the colour of the sea fire.
  *                   foamField: a createFoamField, or nothing at all — see
  *                              `setFoamField` below.
+ *                   wakeField: optional fine createFoamField with inject: 0,
+ *                              centred on the ship — see `setWakeField`.
  *                   cascade: a createDetailCascade, or nothing at all — see
  *                            `setDetailCascade` below. Declined if it reports
  *                            itself disabled or if normalRange is nought.
@@ -973,6 +996,7 @@ export function createOcean(waveField, options = {}) {
     'uCascade', 'uCascadeInvPatch', 'uCascadeGain', 'uCascadeFoam', 'uCascadeFar',
   ];
   let foamField = null;
+  let wakeField = null;
   let reflection = null;
   let cascade = null;
   let hullMask = null;
@@ -1003,6 +1027,15 @@ export function createOcean(waveField, options = {}) {
     }
   }
 
+  function adoptWakeField(next) {
+    wakeField = next ?? null;
+    for (const key of FIELD_UNIFORMS) {
+      const target = key.replace('Foam', 'Wake');
+      if (wakeField) uniforms[target] = wakeField.uniforms[key];
+      else delete uniforms[target];
+    }
+  }
+
   /**
    * The same arrangement for the cascade, with two refusals in it.
    *
@@ -1027,6 +1060,7 @@ export function createOcean(waveField, options = {}) {
       vertexShader: vertexShader(waveCount, detailCount, hullMask !== null),
       fragmentShader: fragmentShader(waveCount, normalRange, detailCount, {
         foamField: foamField !== null,
+        wakeField: wakeField !== null,
         reflection: reflection !== null,
         cascade: cascade !== null,
         hullMask: hullMask !== null,
@@ -1041,6 +1075,7 @@ export function createOcean(waveField, options = {}) {
     });
 
   adoptFoamField(options.foamField);
+  adoptWakeField(options.wakeField);
   adoptCascade(options.cascade);
 
   const material = makeMaterial();
@@ -1199,6 +1234,15 @@ export function createOcean(waveField, options = {}) {
       const had = foamField !== null;
       adoptFoamField(foamOrNull);
       if (had !== (foamField !== null)) rebuild();
+    },
+
+    /** Optional fine wake history. Accepts createFoamField with inject: 0.
+     * The caller centres and updates it around the ship, separately from the
+     * broad crest-memory field. Null removes its uniforms, sampler and cost. */
+    setWakeField(next) {
+      const had = wakeField !== null;
+      adoptWakeField(next);
+      if (had !== (wakeField !== null)) rebuild();
     },
 
     /**

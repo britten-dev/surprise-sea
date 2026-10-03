@@ -181,14 +181,19 @@ const stepFragment = (waveCount) => /* glsl */ `
     // distance passed in is nought, and deliberately: the mesh attenuates the
     // long waves it cannot resolve at range, but a texel two kilometres off is
     // the same size as a texel underfoot and the water there is really breaking.
-    vec2 world = uOrigin + vUv * uExtent;
-    vec3 nrm;
-    float crest;
-    gerstner(world, 0.0, nrm, crest);
+    float breaking = 0.0;
+    // A dedicated wake buffer has no analytic injection. Avoid evaluating
+    // the entire wave table for every texel when it only stores ship churn.
+    if (uInject > 0.0) {
+      vec2 world = uOrigin + vUv * uExtent;
+      vec3 nrm;
+      float crest;
+      gerstner(world, 0.0, nrm, crest);
 
-    float rag = fbm(world * 0.13 * uFoamScale + uWindDir * uTime * -0.5);
-    float breaking =
-      smoothstep(uFoamLo, uFoamHi, crest + (rag - 0.5) * uFoamJitter) * uInject;
+      float rag = fbm(world * 0.13 * uFoamScale + uWindDir * uTime * -0.5);
+      breaking =
+        smoothstep(uFoamLo, uFoamHi, crest + (rag - 0.5) * uFoamJitter) * uInject;
+    }
 
     // Whitest wins, and the answer is clamped every pass. There is no path
     // through this shader by which the buffer can run away or go bad.
@@ -605,6 +610,12 @@ export function createFoamField(waveField, options = {}) {
 
     get halfLife() {
       return halfLife;
+    },
+
+    /** Drop history and pending stamps; the next update overwrites the target. */
+    clear() {
+      first = true;
+      queued = 0;
     },
 
     dispose() {
