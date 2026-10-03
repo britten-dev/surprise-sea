@@ -596,24 +596,17 @@ ${features.shipReflection ? `
     float ffScar = texture2D(uFoamField, ffUv).r;
     crestFoam = max(crestFoam, ffScar * ffScar * uFoamAmount * ffFade);` : ''}
 ${detailCount > 0 ? `
-    // Close in, break the wash into lace. Two octaves of ridged noise at about
-    // a metre and a third of a metre, drifting downwind with everything else,
-    // and living in the mid tones only: fresh white stays white, bare water
-    // stays bare, and what gains structure is the half-broken water between
-    // them — which at ten metres is most of what there is to look at.
+    // Break up the wash gently. High-contrast sub-metre ridges plus a second
+    // hard threshold made persistent wake foam flash as a 30 fps chase camera
+    // crossed it. Keep the stored coverage and give it broad, filtered texture.
     float laceAmt = (1.0 - smoothstep(40.0, 165.0, dist)) * uDetail;
     if (laceAmt > 0.004) {
-      vec2 lp = vUndisp * 0.95 * uFoamScale + uWindDir * uTime * -0.7;
-      float lacework = veins(lp) * 0.62 + veins(lp * 2.6 + 11.3) * 0.38;
+      vec2 lp = vUndisp * 0.42 * uFoamScale + uWindDir * uTime * -0.22;
+      float footprint = max(length(dFdx(lp)), length(dFdy(lp)));
+      float resolved = 1.0 - smoothstep(0.25, 0.8, footprint);
+      float lacework = mix(0.5, fbm(lp), resolved);
       float mids = 4.0 * crestFoam * (1.0 - crestFoam);
-      // The pivot is the ridged noise's own mean, so the lace neither adds
-      // white nor takes it away on balance: it moves white about inside a
-      // patch, which is what lace is, rather than eating holes in one.
-      crestFoam = clamp(crestFoam + (lacework - 0.62) * mids * laceAmt * 0.85, 0.0, 1.0);
-      // And a harder edge than the far field wants. The soft threshold that
-      // stops a crest half a mile off from becoming a white bar is the wrong
-      // answer twenty metres astern, where broken water has a rim to it.
-      crestFoam = mix(crestFoam, smoothstep(0.12, 0.72, crestFoam), laceAmt * 0.6);
+      crestFoam = clamp(crestFoam + (lacework - 0.5) * mids * laceAmt * 0.28, 0.0, 1.0);
     }
 ` : ''}${features.cascade ? `
     // The tile's own micro foam: the steepest facets in the wavelet field,
@@ -662,19 +655,21 @@ ${features.hullMask ? `
         foam = max(foam, contact);
       }
     }
-    // Only the fresh, broken water immediately under the counter follows the hull.
-    // The foam field carries the older wake along her actual track. Long analytical
-    // ribbons here made two ruler-straight white lines which swivelled with her.
+${!features.foamField ? `
+    // Lightweight fallback when there is no persistent wake field (phones).
+    // Detailed water already records the ship's churn; adding a second bright
+    // patch under her counter made unrelated noise flare on and off there.
     float astern = hp.z - uHullBounds.y;
     if (astern > 0.0 && astern < 12.0) {
-      float lace = fbm(vUndisp * 1.8 - uWindDir * uTime * 0.35);
+      float lace = fbm(vec2(hp.x * 0.35, astern * 0.18 - uTime * 0.32));
       float width = 0.65 + astern * 0.15;
       float churn = exp(-pow((hp.x + (lace-0.5)*1.4)/width,2.0));
-      float wakeFoam = churn * smoothstep(0.43,0.76,lace)
+      float wakeFoam = churn * (0.55 + 0.45 * lace)
         * smoothstep(0.8,6.0,abs(uHullSpeed))
-        * smoothstep(0.0,1.2,astern) * (1.0-smoothstep(4.0,12.0,astern)) * 0.32;
+        * smoothstep(0.0,1.2,astern) * (1.0-smoothstep(4.0,12.0,astern)) * 0.14;
       foam = max(foam,wakeFoam);
     }
+` : ''}
 ` : ''}
 
     // Foam is matte and lit like cloth: sun lambert plus sky ambient.
