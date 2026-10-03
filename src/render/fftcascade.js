@@ -58,9 +58,9 @@ const GRAVITY = 9.81;
  *
  * `patch` is the tiling period, and it is the one number with a real trade in
  * it. Larger is a longer repeat and coarser texels; smaller is finer water and
- * a repeat that shows. Thirty-six metres is a compromise the detiling below
- * makes work: from the helm the near field is sixty metres deep, so the eye
- * sees under two periods of it and never a lattice.
+ * a repeat that shows. The ocean shader blends world-anchored phase offsets
+ * from cascade-sampling.js so this finite simulation patch can cover the
+ * wider views available from the external camera without a visible lattice.
  */
 const DEFAULTS = {
   size: 128, // texels square; 256 is the quality option

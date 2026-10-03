@@ -630,7 +630,7 @@ test('a disabled cascade is declined the same way', () => {
   );
 });
 
-test('the fragment stage samples the tile twice and turns the second one back', () => {
+test('the fragment stage blends shifted samples without rotating the wind', () => {
   const field = new WaveField(createSeaState({ preset: 'storm' }), 40000);
   const ocean = createOcean(field, {
     quality: QUALITY,
@@ -639,12 +639,13 @@ test('the fragment stage samples the tile twice and turns the second one back', 
   const src = ocean.mesh.material.fragmentShader;
 
   assert.ok(src.includes('uniform sampler2D uCascade;'));
-  // Two fetches of one tile: the detiling is the whole reason a thirty-six
-  // metre period is allowed under a sixty-metre view.
-  assert.equal((src.match(/texture2D\(uCascade,/g) ?? []).length, 2);
-  assert.ok(src.includes('vec2 fineSlope = vec2(fine.x * 0.4695 + fine.y * 0.8829,'));
+  // Three gradient-filtered fetches bound the near-water cost. The browser
+  // regression measures repetition and energy over six tile widths.
+  assert.equal((src.match(/texture2DGradEXT\(uCascade,/g) ?? []).length, 3);
+  assert.ok(src.includes('sampleCascade(vUndisp * uCascadeInvPatch)'));
+  assert.ok(!src.includes('fineSlope'));
   // The perturbation goes into the normal and nowhere near a position.
-  assert.ok(/n = normalize\(n \+ vec3\(-slope\.x, 0\.0, -slope\.y\) \* cascAmt\);/.test(src));
+  assert.ok(/n = normalize\(n \+ vec3\(-smallWaves\.x, 0\.0, -smallWaves\.y\) \* cascAmt\);/.test(src));
   // And the noise it replaces is turned down by the same amount, so the total
   // quantity of invention on the near water falls rather than rises.
   assert.ok(src.includes('rippleAmt *= 1.0 - 0.75 * cascAmt;'));

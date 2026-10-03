@@ -35,8 +35,8 @@
 // out of geometry the physics cannot see.
 //
 // And optionally, underneath all of that, a spectral tile: a GPU inverse-FFT
-// of a fenced, wind-aligned spectrum, sampled twice at two turns and two scales
-// so its period never shows, and used to perturb the near-field normal and
+// of a fenced, wind-aligned spectrum, sampled with smoothly blended phase offsets
+// to break its repeat, and used to perturb the near-field normal and
 // nothing else. It moves no vertex — not a millimetre, ever — which is why it
 // costs the identity nothing at all and why the vertex stage below is byte for
 // byte the same whether it is switched on or off. See render/fftcascade.js.
@@ -51,6 +51,7 @@
 import * as THREE from 'three';
 import { waveUniforms, oceanVertexChunk, oceanNormalChunk } from '../seastate.js';
 import { warpedGrid } from './grid.js';
+import { cascadeSamplingChunk } from './cascade-sampling.js';
 import {
   DETAIL_COUNT,
   detailTable,
@@ -369,6 +370,7 @@ ${features.foamField ? `
   uniform float uCascadeGain;     // 0 leaves the near field exactly as it was
   uniform float uCascadeFoam;     // micro-foam into the lace, at a low gain
   uniform float uCascadeFar;      // metres at which the tile has faded out
+  ${cascadeSamplingChunk}
 ` : ''}
   varying vec3 vNormal;
   varying vec3 vWorldPos;
@@ -432,31 +434,14 @@ ${normalRange > 0 ? `
     // else — no vertex has ever heard of it — so all it can cost the identity
     // is a shade of light on water that is exactly where the CPU says it is.
     //
-    // Sampled twice, which is the whole of the detiling. The first sample is
-    // the tile as it lies; the second is the same tile turned sixty-two degrees
-    // and shrunk to two fifths, at an offset of its own. Two lattices at an
-    // angle with no common period leave nothing for the eye to lock on to, and
-    // the small one comes with a bonus: at two fifths the scale it carries the
-    // octave *below* the grid's own Nyquist, for the price of a second fetch.
+    // Blend independently shifted samples to remove the tile's repeat. A
+    // second rotated copy still left a visible crossed pattern at 36 metres.
     float cascFoam = 0.0;
     float cascAmt = uCascadeGain * (1.0 - smoothstep(uCascadeFar * 0.45, uCascadeFar, dist));
     if (cascAmt > 0.002) {
-      vec2 cp = vUndisp * uCascadeInvPatch;
-      vec4 broad = texture2D(uCascade, cp);
-
-      vec2 rp = vec2(cp.x * 0.4695 - cp.y * 0.8829, cp.x * 0.8829 + cp.y * 0.4695)
-              * 0.41 + vec2(0.317, 0.113);
-      vec4 fine = texture2D(uCascade, rp);
-      // The turned sample's slope is measured in its own turned frame, so it is
-      // turned back before the two are added. Miss this and the fine octave
-      // lights from sixty degrees off the wind.
-      vec2 fineSlope = vec2(fine.x * 0.4695 + fine.y * 0.8829,
-                           -fine.x * 0.8829 + fine.y * 0.4695);
-
-      vec2 slope = broad.xy * 0.62 + fineSlope * 0.52;
-      cascFoam = max(broad.z, fine.z) * cascAmt;
-
-      n = normalize(n + vec3(-slope.x, 0.0, -slope.y) * cascAmt);
+      vec3 smallWaves = sampleCascade(vUndisp * uCascadeInvPatch);
+      cascFoam = smallWaves.z * cascAmt;
+      n = normalize(n + vec3(-smallWaves.x, 0.0, -smallWaves.y) * cascAmt);
     }
 ` : ''}
     // Ripple the analytic normal with drifting noise. This is the texture of
@@ -1161,7 +1146,7 @@ export function createOcean(waveField, options = {}) {
     /**
      * Put the spectral cascade under the near field, or take it away again.
      *
-     * With one set, the fragment stage samples a tiling slope tile twice and
+     * With one set, the fragment stage blends three shifted samples of a slope tile and
      * perturbs the near-field normal with it, and turns the fbm ripple down by
      * the same amount — the tile is what the noise was pretending to be. With
      * `null` the shader is regenerated without a line of it: no sampler, no
