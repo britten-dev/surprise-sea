@@ -18,7 +18,11 @@ export const hullWaveChunk = /* glsl */ `
       if (v > 0.0 && v < 1.0) {
         float t = (0.5 + v * (uHullTexels.y - 1.0)) / uHullTexels.y;
         float gap = abs(p.x) - texture2D(uHullProfile, vec2(s, t)).r;
-        bow = exp(-pow((gap - 0.4) / 0.85, 2.0))
+        // A pressure crest with a shallow outer hollow catches raking light;
+        // both broaden with way through the water, independently of white foam.
+        float crestWidth = 0.55 + speed * 0.42;
+        bow = (exp(-pow((gap - 0.42) / crestWidth, 2.0))
+          - 0.24 * exp(-pow((gap - 1.8) / 1.1, 2.0)))
           * smoothstep(0.0, 2.5, along) * (1.0 - smoothstep(len*0.12,len*0.48,along));
       }
     }
@@ -44,22 +48,22 @@ export const hullWashChunk = /* glsl */ `
     // Long filaments stretch in the direction of flow, with different eddies
     // on each side. Their displacement shares the same travelling coordinates.
     float curl = noise(vec2(stream * 0.32, side)) - 0.5;
-    vec2 q = vec2(gap * 3.0 + curl * 0.85, stream * 0.48 + side);
+    vec2 q = vec2(gap * 3.0 + curl * 0.85, stream * 0.32 + side);
     float resolved = 1.0 - smoothstep(0.25, 0.85, footprint);
     float lace = mix(0.5, fbm(q), resolved);
     float packets = noise(vec2(stream * 0.21 + side, side * 2.0));
-    float broken = smoothstep(0.28, 0.70, packets);
-    float threads = smoothstep(0.50, 0.74, lace);
-    float edge = 0.3 + shoulder * 1.35 + hu * 0.5 + curl * 0.22;
+    float broken = smoothstep(0.35, 0.76, packets);
+    float threads = smoothstep(0.53, 0.76, lace);
+    float edge = 0.22 + shoulder * 0.95 + hu * 0.32 + curl * 0.18;
     float sheet = 1.0 - smoothstep(0.02, edge, max(0.0, gap));
-    float fringe = exp(-max(0.0, gap) / (0.45 + hu * 1.2));
+    float fringe = exp(-max(0.0, gap) / (0.3 + hu * 0.75));
     // The shoulder breaks; farther aft there is mostly translucent water and
     // separate streaks, rather than a solid white outline all around the ship.
-    float foam = (sheet * shoulder * (0.12 + 0.55 * threads)
-      + fringe * threads * 0.75) * broken * drive * ends;
+    float foam = (sheet * shoulder * (0.08 + 0.65 * threads)
+      + fringe * threads * 0.48) * broken * drive * ends;
     float bubbles = exp(-max(0.0, gap) / (0.5 + hu * 0.7))
-      * (0.3 + 0.7 * lace) * (0.5 + 0.5 * broken) * drive * ends * 0.2;
-    float ripple = (lace - 0.5) * sheet * drive * ends * 0.035;
+      * (0.22 + 0.78 * lace) * (0.3 + 0.7 * broken) * drive * ends * 0.13;
+    float ripple = (lace - 0.5) * sheet * drive * ends * 0.045;
     return vec3(foam, bubbles, ripple);
   }
 `;

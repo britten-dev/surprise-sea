@@ -323,7 +323,8 @@ test('every constant the model uses is on the options object', () => {
   const hull = new Hull();
   for (const key of Object.keys(HULL_DEFAULTS)) {
     assert.ok(key in hull.options, `${key} is not a tunable`);
-    assert.ok(Number.isFinite(hull.options[key]), `${key} is not a number`);
+    if (key === 'attitudeInertia') assert.equal(typeof hull.options[key], 'boolean');
+    else assert.ok(Number.isFinite(hull.options[key]), `${key} is not a number`);
   }
   // The contract's own numbers, which nothing may quietly change.
   assert.equal(HULL_DEFAULTS.length, 39);

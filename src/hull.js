@@ -53,6 +53,7 @@ export const HULL_DEFAULTS = {
   heaveTau: 1.5,
   pitchTau: 1.9,
   rollTau: 2.1,
+  attitudeInertia: false, // opt-in second-order response, retaining angular/heave velocity
 
   // --- Sampling ------------------------------------------------------------
   sampleFore: 0.35, // fore/aft sample arms, as a fraction of length
@@ -173,6 +174,7 @@ export class Hull {
     this.onPooped = null;
 
     this._rollRate = 0;
+    this._attitudeVelocity = { heave: 0, pitch: 0, roll: 0 };
     this._broachSign = 1;
     this._poopTimer = 0;
     this._poopArmed = true;
@@ -343,9 +345,15 @@ export class Hull {
 
     // --- 7. Answer the sea, and move -----------------------------------------
     const prevRoll = this.roll;
-    this.heave += (targetHeave - this.heave) * (1 - Math.exp(-dt / o.heaveTau));
-    this.pitch += (targetPitch - this.pitch) * (1 - Math.exp(-dt / o.pitchTau));
-    this.roll += (targetRoll - this.roll) * (1 - Math.exp(-dt / o.rollTau));
+    if (o.attitudeInertia) {
+      this._answerSea('heave', targetHeave, o.heaveTau, dt);
+      this._answerSea('pitch', targetPitch, o.pitchTau, dt);
+      this._answerSea('roll', targetRoll, o.rollTau, dt);
+    } else {
+      this.heave += (targetHeave - this.heave) * (1 - Math.exp(-dt / o.heaveTau));
+      this.pitch += (targetPitch - this.pitch) * (1 - Math.exp(-dt / o.pitchTau));
+      this.roll += (targetRoll - this.roll) * (1 - Math.exp(-dt / o.rollTau));
+    }
     this._rollRate = (this.roll - prevRoll) / dt;
 
     // Way through the water, plus the water itself: the top of a wave is
@@ -358,6 +366,19 @@ export class Hull {
 
     this._syncTransform();
     return this;
+  }
+
+  _answerSea(axis, target, tau, dt) {
+    // Exact critically damped response for a constant target during this tick.
+    // Two poles with tau/2 retain the old low-frequency lag, but a crest cannot
+    // instantaneously reverse the velocity of a heavy hull. No frame-rate gain.
+    const omega = 2 / Math.max(0.01, tau);
+    const displacement = this[axis] - target;
+    const velocity = this._attitudeVelocity[axis];
+    const c = velocity + omega * displacement;
+    const decay = Math.exp(-omega * dt);
+    this[axis] = target + (displacement + c * dt) * decay;
+    this._attitudeVelocity[axis] = (velocity - omega * c * dt) * decay;
   }
 
   _syncTransform() {
