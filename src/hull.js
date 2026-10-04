@@ -335,10 +335,9 @@ export class Hull {
     // stern drying out again, so a crest that hangs about does not machine-gun
     // the callback.
     const deck = this.heave + o.freeboard;
-    if (this._poopArmed && hStern > deck && this.surfFactor < o.poopSurfLimit) {
+    if (!o.externalPooping && this._poopArmed && hStern > deck && this.surfFactor < o.poopSurfLimit) {
       this._poopArmed = false;
-      this._poopTimer = o.poopDuration;
-      if (this.onPooped) this.onPooped(this);
+      this.notifyPooped();
     } else if (hStern < this.heave + o.freeboard * o.poopReleaseFactor) {
       this._poopArmed = true;
     }
@@ -366,6 +365,12 @@ export class Hull {
 
     this._syncTransform();
     return this;
+  }
+
+  /** Use a model-derived overtopping event when externalPooping is enabled. */
+  notifyPooped() {
+    this._poopTimer = this.options.poopDuration;
+    this.onPooped?.(this);
   }
 
   _answerSea(axis, target, tau, dt) {

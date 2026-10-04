@@ -417,3 +417,42 @@ dips the rail. Deterministic, NaN-free forever, hull never written to.
 `seas.stats` counts every event kind. Tests drive a real Hull through real
 presets and assert those behaviours, plus decay, rate limits, and that
 region defaults span the hull. Export from index.js.
+
+## Model-derived boarding edges (4 October 2026)
+
+`shipSeas` accepts optional `geometry` and `pose` options. Existing generic
+geometry remains the default for other hosts. Coordinates are local metres;
+`pose` has `position` and `quaternion`, defaulting to `hull`.
+
+```js
+{
+  geometry: {
+    bow: { x, y, z },       // actual bow rail
+    stern: { x, y, z },     // actual taffrail, including overhang
+    rails: { port: [point], starboard: [point] },
+    regions: {
+      quarterdeck: {
+        point: { x, y, z }, // actual deck, retained in depth for loss modelling
+        entries: [{ point: { x, y, z }, entry: 'aft' }]
+      }
+    }
+  },
+  pose: shipGroup
+}
+```
+
+Supply every entry edge surrounding each deck: its sides and, where relevant,
+the bow or stern. An external surface above the deck but below its intact
+bulwarks no longer fills that deck. `depth[region]` still reports raw immersion;
+`entryDepth[region]` reports the highest water above an entry edge. The
+`onGreenWater` event includes `entry` (`forward`, `aft`, `port`, `starboard`)
+and its `depth` is entry overtopping. `railDepths[side]` corresponds to the
+explicit rail row, allowing spray to originate at the actual wet location.
+`drainage[region]` reports normalized deck-water units drained per second.
+Reset clears all of these states. Reuse point objects between entry and rail
+rows to avoid repeated wave queries.
+
+When `Hull({externalPooping:true})` is selected, the host calls
+`hull.notifyPooped()` from its model-derived `onSternSea`. This applies the
+existing temporary rudder penalty and callback without a second, lower
+freeboard trigger. Defaults remain unchanged for other hosts.

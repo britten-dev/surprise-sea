@@ -163,14 +163,15 @@ export function shipSeas(hull, waveField, options = {}) {
 
   // --- The points, laid out once ---------------------------------------------
   // They are fastened to her, so they never change in her own frame. All the
-  // per-step work is the transform and the height query, and the height query
-  // is the expensive half: `heightAt` inverts the Gerstner displacement, so
-  // each point costs four passes over the wave table. Fifteen points is about
-  // the most a frame should carry, which is why the rail rows are five and not
-  // fifty — a rail is a straight line and five points read its immersion as
-  // well as five hundred would.
-  const bow = station(-0.5);
-  const stern = station(0.5);
+  // per-step work is the transform and the height query. Keep the perimeter
+  // sparse: heightAt inverts the Gerstner displacement. Shared entry/rail
+  // point objects reuse a sample within the tick.
+  // Hosts can supply the same perimeter and pose as their rendered ship. The
+  // generic default remains available to ships without model-derived geometry.
+  const geometry = options.geometry;
+  const pose = options.pose ?? hull;
+  const bow = geometry?.bow ?? station(-0.5);
+  const stern = geometry?.stern ?? station(0.5);
 
   const regionSpec = options.regions ?? DEFAULT_REGIONS;
   const regions = regionSpec.map((r) => {
@@ -180,7 +181,8 @@ export function shipSeas(hull, waveField, options = {}) {
       from: r.from,
       to: r.to,
       centre,
-      point: station(centre),
+      point: geometry?.regions?.[r.name]?.point ?? station(centre),
+      entries: geometry?.regions?.[r.name]?.entries ?? null,
     };
   });
 
@@ -197,7 +199,10 @@ export function shipSeas(hull, waveField, options = {}) {
     }
     return row;
   };
-  const rails = { port: railRow(-1), starboard: railRow(1) };
+  const rails = geometry?.rails ?? { port: railRow(-1), starboard: railRow(1) };
+  const railDepths = { port: [], starboard: [] };
+  const entryDepth = {}, drainage = {};
+  const samples = new Map();
 
   // --- What the caller sees ---------------------------------------------------
   // `water` is the continuous one: the level standing on each region, 0..1,
@@ -212,6 +217,7 @@ export function shipSeas(hull, waveField, options = {}) {
   for (const r of regions) {
     water[r.name] = 0;
     depth[r.name] = 0;
+    entryDepth[r.name] = drainage[r.name] = 0;
   }
   depth.portRail = 0;
   depth.starboardRail = 0;
@@ -246,8 +252,8 @@ export function shipSeas(hull, waveField, options = {}) {
    */
   function worldInto(local, out) {
     out.set(local.x, local.y, local.z);
-    out.applyQuaternion(hull.quaternion);
-    out.add(hull.position);
+    out.applyQuaternion(pose.quaternion);
+    out.add(pose.position);
     return out;
   }
 
@@ -258,7 +264,8 @@ export function shipSeas(hull, waveField, options = {}) {
    */
   function depthOf(local) {
     const w = worldInto(local, _p);
-    return waveField.heightAt(w.x, w.z) - w.y;
+    if (!samples.has(local)) samples.set(local, waveField.heightAt(w.x, w.z) - w.y);
+    return samples.get(local);
   }
 
   const seas = {
@@ -267,6 +274,7 @@ export function shipSeas(hull, waveField, options = {}) {
     water,
     depth,
     stats,
+    entryDepth, drainage, railDepths,
 
     /** The sample points in her own frame, for anything that wants to draw them. */
     points: { bow, stern, rails, regions: regions.map((r) => r.point) },
@@ -293,6 +301,8 @@ export function shipSeas(hull, waveField, options = {}) {
     /** Dry her out and forget everything — a change of weather, or a new run. */
     reset() {
       time = 0;
+      samples.clear();
+      railDepths.port.length = railDepths.starboard.length = 0;
       prevBowDepth = null;
       plungeAt = -Infinity;
       sternArmed = true;
@@ -300,6 +310,7 @@ export function shipSeas(hull, waveField, options = {}) {
       for (const r of regions) {
         water[r.name] = 0;
         depth[r.name] = 0;
+        entryDepth[r.name] = drainage[r.name] = 0;
         greenArmed[r.name] = true;
         greenAt[r.name] = -Infinity;
       }
@@ -322,6 +333,7 @@ export function shipSeas(hull, waveField, options = {}) {
     update(dt) {
       if (!(dt > 0) || !hull || !waveField) return seas;
       time += dt;
+      samples.clear();
 
       // --- The bow ----------------------------------------------------------
       // The gate is closing speed, and the closing speed is the plain rate of
@@ -394,22 +406,35 @@ export function shipSeas(hull, waveField, options = {}) {
       for (const r of regions) {
         const d = depthOf(r.point);
         depth[r.name] = d;
+        // A deck below the external surface is still dry behind intact planking.
+        // Inflow needs a crest over a physical edge, including the low side when
+        // heeled. Retained water can drain after that edge comes clear again.
+        let inlet = d, entry = r.name === 'quarterdeck' ? 'aft' : 'forward';
+        if (r.entries?.length) {
+          inlet = -Infinity;
+          for (const candidate of r.entries) {
+            const candidateDepth = depthOf(candidate.point);
+            if (candidateDepth > inlet) { inlet = candidateDepth; entry = candidate.entry; }
+          }
+        }
+        entryDepth[r.name] = inlet;
 
         if (
           greenArmed[r.name] &&
-          d > o.greenWaterDepth &&
+          inlet > o.greenWaterDepth &&
           time - greenAt[r.name] >= o.greenWaterCooldown
         ) {
           greenArmed[r.name] = false;
           greenAt[r.name] = time;
           stats.greenWater++;
-          if (seas.onGreenWater) seas.onGreenWater({ region: r.name, depth: d });
-        } else if (d < o.greenWaterRelease) {
+          if (seas.onGreenWater) seas.onGreenWater({ region: r.name, depth: inlet, entry });
+        } else if (inlet < o.greenWaterRelease) {
           greenArmed[r.name] = true;
         }
 
         const fill =
-          d > 0 ? clamp(d / o.floodDepth, 0, 1) * o.fillRate * dt : 0;
+          inlet > 0 ? clamp(inlet / o.floodDepth, 0, 1) * o.fillRate * dt : 0;
+        drainage[r.name] = Math.min(water[r.name] + fill, o.drainRate * dt) / dt;
         water[r.name] = clamp(water[r.name] + fill - o.drainRate * dt, 0, 1);
       }
 
@@ -423,8 +448,10 @@ export function shipSeas(hull, waveField, options = {}) {
         const row = rails[side];
         let under = 0;
         let deepest = -Infinity;
+        railDepths[side].length = 0;
         for (const p of row) {
           const d = depthOf(p);
+          railDepths[side].push(d);
           if (d > deepest) deepest = d;
           if (d > o.railDipDepth) under++;
         }
