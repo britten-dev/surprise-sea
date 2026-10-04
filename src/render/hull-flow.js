@@ -1,7 +1,7 @@
 // Local water displaced by the hull. Shared between the mesh displacement and
 // the close surface normal, so detailed sea normals cannot erase the bow wave.
 export const hullWaveChunk = /* glsl */ `
-  // A small rendering-scale bow wave, bounded to 24 cm. The offshore wave
+  // A speed-dependent pressure crest, bounded to 55 cm. The offshore wave
   // field remains the authority for seakeeping; this is local displaced water.
   float shipWave(vec3 world) {
     float speed = smoothstep(0.6, 7.0, abs(uHullSpeed));
@@ -20,7 +20,7 @@ export const hullWaveChunk = /* glsl */ `
         float gap = abs(p.x) - texture2D(uHullProfile, vec2(s, t)).r;
         // A pressure crest with a shallow outer hollow catches raking light;
         // both broaden with way through the water, independently of white foam.
-        float crestWidth = 0.55 + speed * 0.42;
+        float crestWidth = 0.65 + speed * 0.58;
         bow = (exp(-pow((gap - 0.42) / crestWidth, 2.0))
           - 0.24 * exp(-pow((gap - 1.8) / 1.1, 2.0)))
           * smoothstep(0.0, 2.5, along) * (1.0 - smoothstep(len*0.12,len*0.48,along));
@@ -28,9 +28,17 @@ export const hullWaveChunk = /* glsl */ `
     }
     float aft = max(0.0, p.z - uHullBounds.y);
     float spread = 0.9 + aft * 0.34;
-    float wake = exp(-pow((abs(p.x)-spread) / (0.8+aft*0.022),2.0))
-      * smoothstep(0.0, 4.0, aft) * exp(-aft/36.0);
-    return speed * speed * (bow * 0.24 + wake * 0.11);
+    float wake = exp(-pow((abs(p.x)-spread) / (0.9+aft*0.027),2.0))
+      * smoothstep(0.0, 5.0, aft) * exp(-aft/48.0);
+    // Deep-water gravity-wave scale: lambda = 2*pi*U^2/g. These low,
+    // unbroken transverse undulations read through moving reflections; the
+    // persistent foam field separately remembers the actual curved track.
+    float wavelength = clamp(6.283185 * uHullSpeed*uHullSpeed / 9.81, 4.0, 38.0);
+    float transverse = cos(aft*6.283185/wavelength)
+      * (1.0-smoothstep(spread*.45,spread,abs(p.x)))
+      * smoothstep(2.0,9.0,aft) * exp(-aft/40.0);
+    return speed * speed * (bow * 0.55
+      + (wake * 0.22 + transverse * 0.075) * (1.0-smoothstep(55.0,90.0,aft)));
   }
 `;
 
@@ -52,18 +60,18 @@ export const hullWashChunk = /* glsl */ `
     float resolved = 1.0 - smoothstep(0.25, 0.85, footprint);
     float lace = mix(0.5, fbm(q), resolved);
     float packets = noise(vec2(stream * 0.21 + side, side * 2.0));
-    float broken = smoothstep(0.35, 0.76, packets);
-    float threads = smoothstep(0.53, 0.76, lace);
-    float edge = 0.22 + shoulder * 0.95 + hu * 0.32 + curl * 0.18;
+    float broken = smoothstep(0.24, 0.70, packets);
+    float threads = smoothstep(0.43, 0.73, lace);
+    float edge = 0.28 + shoulder * 1.30 + hu * 0.46 + curl * 0.22;
     float sheet = 1.0 - smoothstep(0.02, edge, max(0.0, gap));
-    float fringe = exp(-max(0.0, gap) / (0.3 + hu * 0.75));
+    float fringe = exp(-max(0.0, gap) / (0.42 + hu * 0.90));
     // The shoulder breaks; farther aft there is mostly translucent water and
     // separate streaks, rather than a solid white outline all around the ship.
-    float foam = (sheet * shoulder * (0.08 + 0.65 * threads)
-      + fringe * threads * 0.48) * broken * drive * ends;
+    float foam = (sheet * shoulder * (0.16 + 0.63 * threads)
+      + fringe * threads * 0.60) * (0.22 + 0.78*broken) * drive * ends;
     float bubbles = exp(-max(0.0, gap) / (0.5 + hu * 0.7))
-      * (0.22 + 0.78 * lace) * (0.3 + 0.7 * broken) * drive * ends * 0.13;
-    float ripple = (lace - 0.5) * sheet * drive * ends * 0.045;
-    return vec3(foam, bubbles, ripple);
+      * (0.22 + 0.78 * lace) * (0.3 + 0.7 * broken) * drive * ends * 0.16;
+    float ripple = (lace - 0.5) * sheet * drive * ends * 0.060;
+    return vec3(min(foam,0.86), bubbles, ripple);
   }
 `;

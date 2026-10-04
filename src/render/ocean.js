@@ -601,10 +601,11 @@ ${features.hullMask ? `
         float gap = abs(hp.x) - texture2D(uHullProfile, vec2(hs, ht)).r;
         hullWashValues = hullWash(hp, gap, hu, flowPixel);
       }
-      // Per-pixel sea normals previously replaced the entire vertex normal,
-      // losing the bow wave. Restore that relief alongside the flowing wash.
-      hullRelief = shipWave(vWorldPos) * nearAmt + hullWashValues.z;
     }
+    // Preserve both bow AND trailing wave relief when detailed sea normals
+    // replace the vertex normal. The previous hull-length gate erased the
+    // stern wave precisely where a following camera should see it.
+    hullRelief = shipWave(vWorldPos) * nearAmt + hullWashValues.z;
     // Screen derivatives give a world-space height gradient without resampling
     // either noise or the hull profile. Evaluate outside the conditional so
     // neighbouring fragments agree at the edge of the affected water.
@@ -804,7 +805,12 @@ ${features.wakeField ? `
     vec2 wfUv = (vWorldPos.xz - uWakeOrigin) * uWakeInvExtent;
     vec2 wfEdge = min(wfUv, 1.0 - wfUv);
     float wfFade = smoothstep(0.0, 0.08, min(wfEdge.x, wfEdge.y));
-    float wakeScar = texture2D(uWakeField, wfUv).r * wfFade * uWakeAmount;
+    float wakeScar = texture2D(uWakeField, wfUv).r * wfFade * uWakeAmount;${features.hullMask ? `
+    // Side water converges astern before the broad foam trail develops. Keep
+    // overlapping history splats from becoming a bright stationary bloom
+    // directly under the counter, while retaining the stronger trail beyond.
+    float fromCounter = length(vec2(hp.x, hp.z-uHullBounds.y));
+    wakeScar *= smoothstep(1.0,9.0,fromCounter);` : ''}
     vec2 wakeGrain = (vWorldPos.xz - uWindDir * uTime * 0.25) * 1.15;
     float wakePixel = max(length(dFdx(wakeGrain)), length(dFdy(wakeGrain)));
     float wakeResolved = 1.0 - smoothstep(0.25, 0.8, wakePixel);
