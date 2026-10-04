@@ -261,3 +261,22 @@ test('a borrowed HDR panorama updates the reflected sky without reallocating the
   assert.equal(disposed, false, 'the panorama belongs to its caller');
   photo.dispose();
 });
+
+test('moonlight stays in sync with the raw reflection and survives partial updates', () => {
+  const sky = createSky({ lighting: { moon: 0.8, sunDir: [0.5, 0.2, 0.8] } });
+  const renderer = stubRenderer(true);
+  sky.updateReflection(renderer);
+  sky.setLighting({ glare: 0.3 });
+  assert.equal(sky.uniforms.uMoon.value, 0.8);
+  sky.setLighting({ moon: 0.5 });
+  sky.updateReflection(renderer);
+  const reflected = renderer.calls.scenes.at(-1).children[0];
+  assert.equal(reflected.material.uniforms.uMoon, sky.uniforms.uMoon);
+  assert.equal(reflected.material.uniforms.uMoon.value, 0.5);
+  assert.equal(renderer.calls.render, 12);
+  sky.setLighting({ moon: 2 });
+  assert.equal(sky.uniforms.uMoon.value, 1);
+  sky.setLighting({ moon: -1 });
+  assert.equal(sky.uniforms.uMoon.value, 0);
+  sky.dispose();
+});

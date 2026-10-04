@@ -70,6 +70,7 @@ const DEFAULT_LIGHTING = {
   skyHaze: 0xa6abab,
   glare: 0.3,
   sunset: 0,
+  moon: 0,
   fogDensity: 1.1, // a multiplier on the base density, not a density
   // Stops in front of the tone map. Storm light is the reference at 1; a sun
   // break wants a little more and dusk a little less.
@@ -287,6 +288,39 @@ export const skyGradientChunk = /* glsl */ `
     return skyGradient(dir, haze, top, sunDir, sunColour, glare);
   }
 
+  // The same moon is seen by the eye, reflection cube and reflected water ray.
+  // Its angular size stays fixed when the camera moves: this is distant light,
+  // not a billboard following the ship. A full moon leaves the sails readable.
+  vec3 moonlitSky(vec3 dir, vec3 haze, vec3 top, vec3 moonDir, vec3 moonColour, float glare, float strength) {
+    vec3 col = skyGradient(dir, haze, top, moonDir, moonColour, glare * 0.12);
+    float angle = length(dir - moonDir);
+    float radius = 0.00465;
+    float aa = max(fwidth(angle), 0.00016);
+    if (angle > 0.22) return col; // the faint halo is already below display precision
+    float disc = 1.0 - smoothstep(radius - aa, radius + aa, angle);
+    float surface = 0.84;
+    if (angle < radius + aa * 2.0) {
+      vec3 pole = abs(moonDir.y) > 0.98 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+      vec3 right = normalize(cross(pole, moonDir));
+      vec3 up = cross(moonDir, right);
+      vec2 lunar = vec2(dot(dir, right), dot(dir, up)) / radius;
+      // Subtle darker maria and a soft limb, rather than a flat white dot.
+      float maria = smoothstep(0.38, 0.64, skyCloud(lunar * 2.7 + vec2(3.7, 9.2)));
+      float limb = sqrt(max(0.0, 1.0 - dot(lunar, lunar)));
+      surface = (0.94 - maria * 0.32) * (0.84 + limb * 0.16);
+    }
+    vec2 p = dir.xz / (max(dir.y, 0.0) + 0.18) * 1.7 + vec2(4.2, 8.1);
+    float cover = smoothstep(0.34, 0.63, skyCloud(p));
+    float throughCloud = exp(-cover * 1.25);
+    float halo = exp(-angle * 90.0) * 0.022 + exp(-angle * 20.0) * 0.003;
+    col += moonColour * (disc * surface * 1.8 + halo) * throughCloud * strength;
+    return col;
+  }
+  vec3 skyGradient(vec3 dir, vec3 haze, vec3 top, vec3 sunDir, vec3 sunColour, float glare, float sunset, float moon) {
+    if (moon > 0.0) return moonlitSky(dir, haze, top, sunDir, sunColour, glare, moon);
+    return skyGradient(dir, haze, top, sunDir, sunColour, glare, sunset);
+  }
+
 `;
 
 /**
@@ -367,6 +401,7 @@ const fragmentShader = (waveCount, normalRange, detailCount, features = {}) => /
   uniform vec3 uSunColour;
   uniform float uGlare;
   uniform float uSunset;
+  uniform float uMoon;
   uniform float uFogDensity;
   uniform vec3 uCameraPos;
   uniform vec2 uWindDir;
@@ -668,7 +703,7 @@ ${features.panorama ? `
       if (uSunset > 0.5 && uSkyPhotoAmount > 0.5) skyCol = photographicSky(reflDir, sun);
       else
 ` : ''}
-        skyCol = skyGradient(reflDir, uSkyHaze, uSkyTop, sun, uSunColour, uGlare, uSunset);
+        skyCol = skyGradient(reflDir, uSkyHaze, uSkyTop, sun, uSunColour, uGlare, uSunset, uMoon);
     }
 ${features.reflection ? `
     // Better than the ramp: the sky dome that is actually overhead, prefiltered
@@ -1041,6 +1076,7 @@ export function createOcean(waveField, options = {}) {
     uSunColour: { value: new THREE.Color() },
     uGlare: { value: 0.3 },
     uSunset: { value: 0 },
+    uMoon: { value: 0 },
     uFogDensity: { value: baseFog },
     uHeightScale: { value: 1 },
     uFoamLo: { value: 0.33 },
@@ -1227,6 +1263,7 @@ export function createOcean(waveField, options = {}) {
     uniforms.uSunDir.value.set(...lighting.sunDir).normalize();
     uniforms.uGlare.value = lighting.glare ?? 0.4;
     uniforms.uSunset.value = lighting.sunset ? 1 : 0;
+    uniforms.uMoon.value = Math.max(0, Math.min(1, lighting.moon ?? 0));
     uniforms.uSkyPhotoConfig.value.w = Math.max(0, Math.min(1, lighting.skyRain ?? 0));
     uniforms.uFogDensity.value = baseFog * (lighting.fogDensity ?? 1);
     uniforms.uExposure.value = lighting.exposure ?? 1;

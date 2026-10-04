@@ -28,3 +28,13 @@ cloud calculation. Existing profiles and callers need no panorama or new options
 Panoramas are static; this feature does not simulate moving cloud volumes, an
 astronomical location, or a day/night cycle. Source selection, download, lifetime
 and device resolution are the host application's responsibilities.
+
+## Moonlight
+
+`lighting.moon` enables a procedural full moon (0..1 visibility, default 0).
+The existing `sunDir` and `sunColour` describe the dominant celestial light,
+so they are used for the moon in this mode as well. The disc, halo and cloud
+attenuation are identical in the visible sky, raw reflection cube and water
+fallback. `glare` controls the existing surface glint. Set `moon: 0` explicitly
+when switching back to another profile; partial updates keep the current value.
+The default directional gradient API remains backward compatible.

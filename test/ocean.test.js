@@ -397,3 +397,16 @@ test('ocean fallback uses the same borrowed panorama and sunset profile as the d
   assert.ok(!ocean.mesh.material.fragmentShader.includes('sampler2D uSkyPhoto'));
   ocean.dispose();
 });
+
+test('moonlight is optional and survives sea-state and partial lighting changes', () => {
+  const { ocean } = rig();
+  assert.equal(ocean.uniforms.uMoon.value, 0);
+  ocean.setLighting({ moon: 0.8 });
+  ocean.setSeaState(createSeaState({ preset: 'breeze' }));
+  ocean.setLighting({ glare: 0.35 });
+  assert.equal(ocean.uniforms.uMoon.value, 0.8);
+  assertUniformsExact(ocean.mesh.material.fragmentShader, 'moonlit sea');
+  ocean.setLighting({ moon: 0 });
+  assert.equal(ocean.uniforms.uMoon.value, 0);
+  ocean.dispose();
+});

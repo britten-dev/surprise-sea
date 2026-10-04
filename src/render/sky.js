@@ -45,6 +45,7 @@ const DEFAULT_LIGHTING = {
   skyHaze: 0xa6abab,
   glare: 0.3,
   sunset: 0,
+  moon: 0,
   exposure: 1,
 };
 
@@ -97,6 +98,7 @@ const fragmentShader = (graded) => /* glsl */ `
   uniform vec3 uSunColour;
   uniform float uGlare;
   uniform float uSunset;
+  uniform float uMoon;
   uniform float uExposure;
 
   varying vec3 vDir;
@@ -105,7 +107,7 @@ const fragmentShader = (graded) => /* glsl */ `
     vec3 d = normalize(vDir);
     vec3 col;
     if (uSunset > 0.5 && uSkyPhotoAmount > 0.5) col = photographicSky(d, normalize(uSunDir));
-    else col = skyGradient(d, uHaze, uTop, normalize(uSunDir), uSunColour, uGlare, uSunset);
+    else col = skyGradient(d, uHaze, uTop, normalize(uSunDir), uSunColour, uGlare, uSunset, uMoon);
 ${graded ? `
     gl_FragColor = vec4(agxToneMap(col, uExposure), 1.0);
 
@@ -121,7 +123,7 @@ ${graded ? `
  *
  * @param options
  *   `lighting`        the same object `createOcean` takes; `sunDir`,
- *                     `sunColour`, `skyTop`, `skyHaze`, `glare`, `sunset` and `exposure`
+ *                     `sunColour`, `skyTop`, `skyHaze`, `glare`, `sunset`, `moon` and `exposure`
  *                     are the keys read. Partial objects are welcome — what is
  *                     left out keeps the value it had.
  *   `reflectionSize`  face size of the cube; 128 by default, 0 to do without
@@ -142,6 +144,7 @@ export function createSky(options = {}) {
     uSunColour: { value: new THREE.Color() },
     uGlare: { value: 0.3 },
     uSunset: { value: 0 },
+    uMoon: { value: 0 },
     uExposure: { value: 1 },
   };
 
@@ -224,6 +227,7 @@ export function createSky(options = {}) {
     if (light.sunDir) uniforms.uSunDir.value.set(...light.sunDir).normalize();
     uniforms.uGlare.value = light.glare ?? 0.4;
     uniforms.uSunset.value = light.sunset ? 1 : 0;
+    uniforms.uMoon.value = Math.max(0, Math.min(1, light.moon ?? 0));
     uniforms.uSkyPhotoConfig.value.w = Math.max(0, Math.min(1, light.skyRain ?? 0));
     uniforms.uExposure.value = light.exposure ?? 1;
 
