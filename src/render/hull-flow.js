@@ -1,7 +1,7 @@
 // Local water displaced by the hull. Shared between the mesh displacement and
 // the close surface normal, so detailed sea normals cannot erase the bow wave.
 export const hullWaveChunk = /* glsl */ `
-  // A speed-dependent pressure crest, bounded to 55 cm. The offshore wave
+  // A speed-dependent pressure crest, bounded to 72 cm. The offshore wave
   // field remains the authority for seakeeping; this is local displaced water.
   float shipWave(vec3 world) {
     float speed = smoothstep(0.6, 7.0, abs(uHullSpeed));
@@ -20,9 +20,9 @@ export const hullWaveChunk = /* glsl */ `
         float gap = abs(p.x) - texture2D(uHullProfile, vec2(s, t)).r;
         // A pressure crest with a shallow outer hollow catches raking light;
         // both broaden with way through the water, independently of white foam.
-        float crestWidth = 0.65 + speed * 0.58;
-        bow = (exp(-pow((gap - 0.42) / crestWidth, 2.0))
-          - 0.24 * exp(-pow((gap - 1.8) / 1.1, 2.0)))
+        float crestWidth = 0.72 + speed * 0.78;
+        bow = (exp(-pow((gap - 0.60) / crestWidth, 2.0))
+          - 0.24 * exp(-pow((gap - 2.3) / 1.35, 2.0)))
           * smoothstep(0.0, 2.5, along) * (1.0 - smoothstep(len*0.12,len*0.48,along));
       }
     }
@@ -37,7 +37,7 @@ export const hullWaveChunk = /* glsl */ `
     float transverse = cos(aft*6.283185/wavelength)
       * (1.0-smoothstep(spread*.45,spread,abs(p.x)))
       * smoothstep(2.0,9.0,aft) * exp(-aft/40.0);
-    return speed * speed * (bow * 0.55
+    return speed * speed * (bow * 0.72
       + (wake * 0.22 + transverse * 0.075) * (1.0-smoothstep(55.0,90.0,aft)));
   }
 `;
