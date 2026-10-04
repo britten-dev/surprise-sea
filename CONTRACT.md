@@ -456,3 +456,19 @@ When `Hull({externalPooping:true})` is selected, the host calls
 `hull.notifyPooped()` from its model-derived `onSternSea`. This applies the
 existing temporary rudder penalty and callback without a second, lower
 freeboard trigger. Defaults remain unchanged for other hosts.
+
+
+### Changing the ocean rendering budget
+
+`ocean.gridResolution` reports the current visible grid density.
+`ocean.setGridResolution(n)` replaces only that grid, retaining the mesh,
+material, uniforms, wave spectrum, clock, spatial extent and grid warp. It
+accepts finite numbers, rounds and clamps to 32–512 vertices per side, and
+releases the previous geometry. Repeating the current resolution is a no-op.
+`dispose()` releases the active replacement geometry as well as the material.
+
+This is a host-controlled visual budget, not a change to the sea physics.
+The same vertex shader samples the same wave field on a coarser or finer mesh;
+CPU height/velocity samples and seakeeping do not change. Hosts should change
+the budget sparingly after sustained performance measurements. The regression
+check is `node --test test/ocean-quality.test.js`.

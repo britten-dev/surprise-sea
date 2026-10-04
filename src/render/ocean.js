@@ -1054,7 +1054,8 @@ function setColour(uniform, value) {
  */
 export function createOcean(waveField, options = {}) {
   const quality = { ...DEFAULT_QUALITY, ...(options.quality ?? {}) };
-  const geometry = warpedGrid(quality.gridN, quality.halfSpan, quality.exponent);
+  let geometry = warpedGrid(quality.gridN, quality.halfSpan, quality.exponent);
+  let gridResolution = quality.gridN;
 
   // The base density; a lighting preset scales it. Kept separately because
   // setLighting hands over a multiplier, not an answer.
@@ -1293,6 +1294,17 @@ export function createOcean(waveField, options = {}) {
   return {
     mesh,
     uniforms,
+    get gridResolution() { return gridResolution; },
+    /** Render tessellation only; the spectrum, wave clock and physics are unchanged. */
+    setGridResolution(value) {
+      if (!Number.isFinite(value)) throw new TypeError('grid resolution must be finite');
+      const n = Math.max(32, Math.min(512, Math.round(value)));
+      if (n === gridResolution) return n;
+      const next = warpedGrid(n, quality.halfSpan, quality.exponent);
+      const old = geometry; geometry = next; mesh.geometry = next; gridResolution = n;
+      old.dispose();
+      return n;
+    },
 
     /** The wavelet table in force, budget and all. Read-only, and mostly read
      *  by the tests that hold this file to the fifteen-centimetre law. */
