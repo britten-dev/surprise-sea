@@ -228,3 +228,36 @@ test('dispose lets go of the cube, and disposing twice is safe', () => {
   assert.equal(sky.reflection, null);
   assert.doesNotThrow(() => sky.dispose());
 });
+
+test('a non-default sunset survives partial lighting updates and can be switched off', () => {
+  const sky = createSky({ lighting: { skyTop: 0x123456, sunset: 1, exposure: 0.8 } });
+  sky.setLighting({ glare: 0.7 });
+  assert.equal(sky.uniforms.uSunset.value, 1);
+  assert.equal(sky.uniforms.uTop.value.getHexString(), '123456');
+  assert.equal(sky.uniforms.uExposure.value, 0.8);
+  sky.setLighting({ sunset: 0 });
+  assert.equal(sky.uniforms.uSunset.value, 0);
+  sky.dispose();
+});
+
+test('a borrowed HDR panorama updates the reflected sky without reallocating the cube', () => {
+  const sky = createSky({ lighting: { sunset: 1 } });
+  const renderer = stubRenderer(true), photo = new THREE.DataTexture();
+  let disposed = false; photo.addEventListener('dispose', () => { disposed = true; });
+  const original = sky.updateReflection(renderer);
+  sky.setPanorama(photo, { sunU: 0.6128, sunElevation: 0.0828, intensity: 0.72 });
+  assert.equal(sky.uniforms.uSkyPhoto.value, photo);
+  assert.equal(sky.uniforms.uSkyPhotoAmount.value, 1);
+  assert.deepEqual(sky.uniforms.uSkyPhotoConfig.value.toArray(), [0.6128, 0.0828, 0.72, 0]);
+  sky.setLighting({ skyRain: 0.4 });
+  assert.equal(sky.uniforms.uSkyPhotoConfig.value.w, 0.4);
+  assert.equal(sky.updateReflection(renderer), original);
+  assert.equal(renderer.calls.render, 12);
+  sky.setPanorama(null);
+  assert.equal(sky.uniforms.uSkyPhotoAmount.value, 0);
+  sky.updateReflection(renderer);
+  assert.equal(renderer.calls.render, 18);
+  sky.dispose();
+  assert.equal(disposed, false, 'the panorama belongs to its caller');
+  photo.dispose();
+});

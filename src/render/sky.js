@@ -17,7 +17,7 @@
 // only when the lighting changes, so it is rendered only when the lighting
 // changes: `setLighting` marks the cube stale, `updateReflection` re-renders it
 // if it is, and a caller who forgets and calls it every frame pays nothing.
-// Six faces of a shader with no textures and no loops is about a third of a
+// Six faces of a procedural shader cost about a tenth of a
 // megapixel — cheaper than one frame of the sea, and it happens when a slider
 // moves rather than sixty times a second.
 //
@@ -34,7 +34,8 @@
 // need none, and the cube render target is not made until a renderer arrives.
 
 import * as THREE from 'three';
-import { skyGradientChunk, agxToneMapChunk } from './ocean.js';
+import { skyPanoramaUniforms, setSkyPanorama } from './sky-panorama.js';
+import { skyGradientChunk, skyPanoramaChunk, agxToneMapChunk } from './ocean.js';
 
 /** The shipped storm, and the shape a lighting object takes. */
 const DEFAULT_LIGHTING = {
@@ -43,6 +44,7 @@ const DEFAULT_LIGHTING = {
   skyTop: 0x67737f,
   skyHaze: 0xa6abab,
   glare: 0.3,
+  sunset: 0,
   exposure: 1,
 };
 
@@ -86,6 +88,7 @@ const vertexShader = /* glsl */ `
  */
 const fragmentShader = (graded) => /* glsl */ `
   ${skyGradientChunk}
+  ${skyPanoramaChunk}
   ${graded ? agxToneMapChunk : ''}
 
   uniform vec3 uTop;
@@ -93,13 +96,16 @@ const fragmentShader = (graded) => /* glsl */ `
   uniform vec3 uSunDir;
   uniform vec3 uSunColour;
   uniform float uGlare;
+  uniform float uSunset;
   uniform float uExposure;
 
   varying vec3 vDir;
 
   void main() {
     vec3 d = normalize(vDir);
-    vec3 col = skyGradient(d, uHaze, uTop, normalize(uSunDir), uSunColour, uGlare);
+    vec3 col;
+    if (uSunset > 0.5 && uSkyPhotoAmount > 0.5) col = photographicSky(d, normalize(uSunDir));
+    else col = skyGradient(d, uHaze, uTop, normalize(uSunDir), uSunColour, uGlare, uSunset);
 ${graded ? `
     gl_FragColor = vec4(agxToneMap(col, uExposure), 1.0);
 
@@ -115,7 +121,7 @@ ${graded ? `
  *
  * @param options
  *   `lighting`        the same object `createOcean` takes; `sunDir`,
- *                     `sunColour`, `skyTop`, `skyHaze`, `glare` and `exposure`
+ *                     `sunColour`, `skyTop`, `skyHaze`, `glare`, `sunset` and `exposure`
  *                     are the keys read. Partial objects are welcome — what is
  *                     left out keeps the value it had.
  *   `reflectionSize`  face size of the cube; 128 by default, 0 to do without
@@ -129,11 +135,13 @@ ${graded ? `
  */
 export function createSky(options = {}) {
   const uniforms = {
+    ...skyPanoramaUniforms(),
     uTop: { value: new THREE.Color() },
     uHaze: { value: new THREE.Color() },
     uSunDir: { value: new THREE.Vector3(0.35, 0.3, 0.65) },
     uSunColour: { value: new THREE.Color() },
     uGlare: { value: 0.3 },
+    uSunset: { value: 0 },
     uExposure: { value: 1 },
   };
 
@@ -206,14 +214,17 @@ export function createSky(options = {}) {
     cubeScene.add(rawMesh);
   }
 
+  let light = { ...DEFAULT_LIGHTING };
   function setLighting(next = {}) {
-    const light = { ...DEFAULT_LIGHTING, ...next };
+    light = { ...light, ...next };
 
     readColour(uniforms.uTop.value, light.skyTop);
     readColour(uniforms.uHaze.value, light.skyHaze);
     readColour(uniforms.uSunColour.value, light.sunColour);
     if (light.sunDir) uniforms.uSunDir.value.set(...light.sunDir).normalize();
     uniforms.uGlare.value = light.glare ?? 0.4;
+    uniforms.uSunset.value = light.sunset ? 1 : 0;
+    uniforms.uSkyPhotoConfig.value.w = Math.max(0, Math.min(1, light.skyRain ?? 0));
     uniforms.uExposure.value = light.exposure ?? 1;
 
     // The sky the sea reflects is now a lie. It stays one until someone with a
@@ -233,6 +244,11 @@ export function createSky(options = {}) {
     },
 
     setLighting,
+    /** Borrow a linear HDR panorama; pass null to return to the procedural sky. */
+    setPanorama(texture, options) {
+      setSkyPanorama(uniforms, texture, options);
+      stale = true;
+    },
 
     /**
      * Re-render the cube, if the weather has moved since the last time.

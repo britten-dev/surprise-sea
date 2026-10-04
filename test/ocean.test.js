@@ -379,3 +379,21 @@ test('a foam profile survives a sea with no waves in it at all', () => {
   for (const v of Object.values(p)) assert.ok(Number.isFinite(v), JSON.stringify(p));
   assert.ok(p.foamHi > p.foamLo);
 });
+
+test('ocean fallback uses the same borrowed panorama and sunset profile as the dome', () => {
+  const { ocean } = rig({ lighting: { sunset: 1 } });
+  const texture = { isTexture: true };
+  ocean.setPanorama(texture, { sunU: 0.61, sunElevation: 0.08, intensity: 0.72 });
+  assert.ok(ocean.mesh.material.fragmentShader.includes('photographicSky(reflDir, sun)'));
+  assertUniformsExact(ocean.mesh.material.fragmentShader, 'photographic fallback');
+  ocean.setLighting({ skyRain: 0.6 });
+  assert.equal(ocean.uniforms.uSunset.value, 1);
+  assert.equal(ocean.uniforms.uSkyPhoto.value, texture);
+  assert.deepEqual(ocean.uniforms.uSkyPhotoConfig.value.toArray(), [0.61, 0.08, 0.72, 0.6]);
+  ocean.setLighting({ sunset: 0 });
+  assert.equal(ocean.uniforms.uSunset.value, 0);
+  ocean.setPanorama(null);
+  assert.equal(ocean.uniforms.uSkyPhotoAmount.value, 0);
+  assert.ok(!ocean.mesh.material.fragmentShader.includes('sampler2D uSkyPhoto'));
+  ocean.dispose();
+});

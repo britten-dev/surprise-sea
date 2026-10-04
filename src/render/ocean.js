@@ -53,6 +53,7 @@ import { waveUniforms, oceanVertexChunk, oceanNormalChunk } from '../seastate.js
 import { warpedGrid } from './grid.js';
 import { cascadeSamplingChunk } from './cascade-sampling.js';
 import { hullWaveChunk, hullWashChunk } from './hull-flow.js';
+import { skyPanoramaUniforms, setSkyPanorama } from './sky-panorama.js';
 import {
   DETAIL_COUNT,
   detailTable,
@@ -68,6 +69,7 @@ const DEFAULT_LIGHTING = {
   skyTop: 0x67737f,
   skyHaze: 0xa6abab,
   glare: 0.3,
+  sunset: 0,
   fogDensity: 1.1, // a multiplier on the base density, not a density
   // Stops in front of the tone map. Storm light is the reference at 1; a sun
   // break wants a little more and dusk a little less.
@@ -166,6 +168,28 @@ ${hullMask ? `
  * hand-tuned ramps drift apart the first time either is touched. Drop this in
  * beside the dome shader and both read the same formula.
  */
+export const skyPanoramaChunk = /* glsl */ `
+  uniform sampler2D uSkyPhoto;
+  uniform float uSkyPhotoAmount;
+  uniform vec4 uSkyPhotoConfig;
+
+  vec3 photographicSky(vec3 dir, vec3 sunDir) {
+    // HDRLoader flips image rows: v=0.5 is the horizon and v=1 the zenith.
+    // Keep the horizon level; shift elevation rather than tilting the whole dome.
+    float azimuth = atan(dir.z, dir.x) - atan(sunDir.z, sunDir.x);
+    float elevation = asin(clamp(dir.y, -1.0, 1.0));
+    vec2 uv = vec2(fract(azimuth / 6.28318530718 + uSkyPhotoConfig.x),
+      clamp(0.5 + (elevation + uSkyPhotoConfig.y - asin(sunDir.y)) / 3.14159265359, 0.001, 0.999));
+    vec3 colour = texture2D(uSkyPhoto, uv).rgb * uSkyPhotoConfig.z;
+    // A restrained evening grade; the actual cloud shapes and shadow remain
+    // photographic. Lower cloud warms first, while the upper vault stays blue.
+    colour *= mix(vec3(1.25, 0.72, 0.43), vec3(0.92, 0.94, 1.0), smoothstep(0.0, 0.6, max(dir.y, 0.0)));
+    float grey = dot(colour, vec3(0.2126, 0.7152, 0.0722));
+    return mix(colour, vec3(grey), uSkyPhotoConfig.w * 0.45) * (1.0 - uSkyPhotoConfig.w * 0.45);
+  }
+
+`;
+
 export const skyGradientChunk = /* glsl */ `
   float skyHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
   float skyNoise(vec2 p) {
@@ -206,6 +230,63 @@ export const skyGradientChunk = /* glsl */ `
     }
     return col;
   }
+  // Sunset is an opt-in atmosphere. Keep the sun at its actual angular diameter
+  // (about half a degree); the surrounding aureole supplies the photographic glow.
+  // Both cloud decks are evaluated in world directions, so orbiting the camera
+  // reveals a continuous sky instead of sliding a background behind the ship.
+  vec3 sunsetSky(vec3 dir, vec3 haze, vec3 top, vec3 sunDir, vec3 sunColour, float glare) {
+    float altitude = max(dir.y, 0.0);
+    float toward = max(0.0, dot(normalize(dir.xz + vec2(0.0001)),
+                                normalize(sunDir.xz + vec2(0.0001))));
+    float facing = pow(toward, 6.0);
+    float s = max(0.0, dot(dir, sunDir));
+    // A cool vault, a rose-grey belt away from the sun, and amber haze toward it.
+    vec3 horizon = mix(haze * vec3(0.76, 0.82, 1.04), vec3(1.02, 0.32, 0.085), facing);
+    vec3 middle = mix(top * 1.45, vec3(0.53, 0.23, 0.17), facing * 0.68);
+    vec3 col = mix(horizon, middle, smoothstep(0.0, 0.22, altitude));
+    col = mix(col, top, smoothstep(0.12, 0.76, altitude));
+    col += sunColour * (pow(s, 12.0) * 0.08 + pow(s, 180.0) * 0.5) * glare;
+
+    // Perspective compresses the distant low cloud bank toward the horizon.
+    // Warping the density breaks the regular patches of a single noise octave.
+    vec2 wind = normalize(sunDir.xz + vec2(0.0001));
+    vec2 p = dir.xz / (altitude + 0.13) * 2.1 + vec2(4.2, 8.1);
+    vec2 warp = vec2(skyNoise(p * 0.7), skyNoise(p * 0.7 + 31.7));
+    float density = skyCloud(p + warp * 0.7);
+    float cover = smoothstep(0.46, 0.68, density);
+    float litDensity = skyCloud(p + warp * 0.7 + wind * 0.22);
+    float edge = clamp((density - litDensity) * 8.0, 0.0, 1.0);
+    float depth = smoothstep(0.47, 0.73, density);
+    // Sun-facing edges and thin cloud transmit amber; thick interiors stay slate.
+    vec3 underside = mix(vec3(0.047, 0.062, 0.092), haze * 0.24, facing);
+    vec3 litCloud = mix(vec3(0.20, 0.23, 0.30), vec3(0.90, 0.32, 0.105), facing);
+    vec3 cloudColour = mix(underside, litCloud, clamp(edge * 0.78 + (1.0 - depth) * 0.19, 0.0, 1.0));
+    float farHaze = 1.0 - smoothstep(0.015, 0.14, altitude);
+    cloudColour = mix(cloudColour, horizon * 0.79, farHaze * 0.72);
+    float lowCloud = cover * smoothstep(0.0, 0.025, altitude);
+
+    // High, wind-combed ice cloud catches the light above the lower deck.
+    vec2 highP = dir.xz / (altitude + 0.3);
+    highP = mat2(0.8, -0.6, 0.6, 0.8) * highP;
+    float filaments = skyCloud(highP * vec2(1.7, 10.0) + vec2(19.4, 6.8));
+    float veil = smoothstep(0.51, 0.72, filaments) * 0.38 * smoothstep(0.03, 0.20, altitude);
+    col = mix(col, mix(vec3(0.35, 0.40, 0.49), vec3(0.94, 0.43, 0.23), facing), veil);
+
+    // Use angular distance instead of a high power of dot(): a round, stable disc
+    // with a subpixel-soft edge. Cloud optical depth attenuates it before compositing.
+    float angle = length(dir - sunDir);
+    float disc = 1.0 - smoothstep(0.0041, 0.0052, angle);
+    float corona = exp(-angle * 85.0) * 0.7;
+    float transmission = exp(-lowCloud * 6.0 - veil * 2.0);
+    col = mix(col, cloudColour, lowCloud * 0.96);
+    col += sunColour * (disc * 9.0 + corona) * glare * transmission;
+    return col;
+  }
+  vec3 skyGradient(vec3 dir, vec3 haze, vec3 top, vec3 sunDir, vec3 sunColour, float glare, float sunset) {
+    if (sunset > 0.5) return sunsetSky(dir, haze, top, sunDir, sunColour, glare);
+    return skyGradient(dir, haze, top, sunDir, sunColour, glare);
+  }
+
 `;
 
 /**
@@ -274,6 +355,7 @@ const fragmentShader = (waveCount, normalRange, detailCount, features = {}) => /
   ${normalRange > 0 ? oceanNormalChunk(waveCount) : ''}
   ${detailCount > 0 ? detailNormalChunk(detailCount) : ''}
   ${skyGradientChunk}
+  ${features.panorama ? skyPanoramaChunk : ''}
   ${agxToneMapChunk}
 
   uniform vec3 uDeep;
@@ -284,6 +366,7 @@ const fragmentShader = (waveCount, normalRange, detailCount, features = {}) => /
   uniform vec3 uSunDir;
   uniform vec3 uSunColour;
   uniform float uGlare;
+  uniform float uSunset;
   uniform float uFogDensity;
   uniform vec3 uCameraPos;
   uniform vec2 uWindDir;
@@ -573,7 +656,20 @@ ${detailCount > 0 ? `
     // with, evaluated along the reflected ray, so the sea mirrors the sky that
     // is actually there rather than an approximation of it.
     vec3 reflDir = reflect(-viewDir, n);
-    vec3 skyCol = skyGradient(reflDir, uSkyHaze, uSkyTop, sun, uSunColour, uGlare);
+    vec3 skyCol;
+${features.reflection ? `
+    // With a complete reflection cube, do not also evaluate the cloud layers for
+    // every water pixel. The no-cube path still draws exactly the same sky.
+    if (uSkyReflAmount >= 0.999) skyCol = vec3(0.0);
+    else
+` : ''}
+    {
+${features.panorama ? `
+      if (uSunset > 0.5 && uSkyPhotoAmount > 0.5) skyCol = photographicSky(reflDir, sun);
+      else
+` : ''}
+        skyCol = skyGradient(reflDir, uSkyHaze, uSkyTop, sun, uSunColour, uGlare, uSunset);
+    }
 ${features.reflection ? `
     // Better than the ramp: the sky dome that is actually overhead, prefiltered
     // into a cube and sampled along the reflected ray, so the sun sits where the
@@ -932,6 +1028,7 @@ export function createOcean(waveField, options = {}) {
 
   const uniforms = {
     ...waveUniforms(sea),
+    ...skyPanoramaUniforms(),
     uTime: { value: waveField.time ?? 0 },
     uCameraPos: { value: new THREE.Vector3() },
     uWindDir: { value: downwind(pinnedWind ?? sea.windFromDeg ?? 285) },
@@ -943,6 +1040,7 @@ export function createOcean(waveField, options = {}) {
     uSunDir: { value: new THREE.Vector3() },
     uSunColour: { value: new THREE.Color() },
     uGlare: { value: 0.3 },
+    uSunset: { value: 0 },
     uFogDensity: { value: baseFog },
     uHeightScale: { value: 1 },
     uFoamLo: { value: 0.33 },
@@ -1062,6 +1160,7 @@ export function createOcean(waveField, options = {}) {
         foamField: foamField !== null,
         wakeField: wakeField !== null,
         reflection: reflection !== null,
+        panorama: uniforms.uSkyPhotoAmount.value > 0,
         cascade: cascade !== null,
         hullMask: hullMask !== null,
         shipReflection: shipReflection !== null,
@@ -1127,6 +1226,8 @@ export function createOcean(waveField, options = {}) {
     setColour(uniforms.uSunColour, lighting.sunColour);
     uniforms.uSunDir.value.set(...lighting.sunDir).normalize();
     uniforms.uGlare.value = lighting.glare ?? 0.4;
+    uniforms.uSunset.value = lighting.sunset ? 1 : 0;
+    uniforms.uSkyPhotoConfig.value.w = Math.max(0, Math.min(1, lighting.skyRain ?? 0));
     uniforms.uFogDensity.value = baseFog * (lighting.fogDensity ?? 1);
     uniforms.uExposure.value = lighting.exposure ?? 1;
 
@@ -1165,6 +1266,11 @@ export function createOcean(waveField, options = {}) {
     },
 
     setLighting,
+    setPanorama(texture, options) {
+      const hadPhoto = uniforms.uSkyPhotoAmount.value > 0;
+      setSkyPanorama(uniforms, texture, options);
+      if (hadPhoto !== (uniforms.uSkyPhotoAmount.value > 0)) rebuild();
+    },
 
     /** Linear-light colour and depth of the ship body from the active camera.
      *  Optional: removing the capture compiles out both samplers and all work. */
