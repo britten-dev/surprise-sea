@@ -100,6 +100,7 @@ const fragmentShader = (graded) => /* glsl */ `
   uniform float uSunset;
   uniform float uMoon;
   uniform float uExposure;
+  uniform float uToneMap;
 
   varying vec3 vDir;
 
@@ -109,7 +110,10 @@ const fragmentShader = (graded) => /* glsl */ `
     if (uSunset > 0.5 && uSkyPhotoAmount > 0.5) col = photographicSky(d, normalize(uSunDir));
     else col = skyGradient(d, uHaze, uTop, normalize(uSunDir), uSunColour, uGlare, uSunset, uMoon);
 ${graded ? `
-    gl_FragColor = vec4(agxToneMap(col, uExposure), 1.0);
+    // The host may grade the whole frame itself (setToneMapped(false)): then
+    // the dome is written linear, as the cube is, and graded with everything else.
+    if (uToneMap > 0.5) col = agxToneMap(col, uExposure);
+    gl_FragColor = vec4(col, 1.0);
 
     #include <colorspace_fragment>
 ` : `
@@ -146,6 +150,7 @@ export function createSky(options = {}) {
     uSunset: { value: 0 },
     uMoon: { value: 0 },
     uExposure: { value: 1 },
+    uToneMap: { value: 1 },
   };
 
   const size = options.reflectionSize ?? REFLECTION_SIZE;
@@ -248,6 +253,13 @@ export function createSky(options = {}) {
     },
 
     setLighting,
+    /** Whether the dome applies AgX itself (the default). Off, it writes linear
+     *  scene radiance, unexposed, for a host that tone maps the whole frame
+     *  once. The reflection cube is unaffected: it is always linear. */
+    setToneMapped(on) {
+      uniforms.uToneMap.value = on ? 1 : 0;
+    },
+    get toneMapped() { return uniforms.uToneMap.value > 0.5; },
     /** Borrow a linear HDR panorama; pass null to return to the procedural sky. */
     setPanorama(texture, options) {
       setSkyPanorama(uniforms, texture, options);

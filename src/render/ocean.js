@@ -440,6 +440,7 @@ ${features.hullMask ? `
   uniform float uFoamScale;    // foam texture frequency, from the dominant wave
   uniform float uRipple;       // strength of the wind-texture normal
   uniform float uExposure;     // stops in front of the tone map
+  uniform float uToneMap;      // 1: exposure and AgX here. 0: linear scene value out, for a host that grades
   uniform vec3 uGlow;          // sea fire: the colour churned water burns
   uniform float uGlowAmount;   // 0..1, already put out by whatever sky is up
 ${detailCount > 0 ? '  uniform float uDetail;       // 0 turns the near-field treatment off' : ''}
@@ -934,7 +935,10 @@ ${!features.foamField && !features.wakeField ? `
 
     // Exposure and the tone curve last, on the assembled scene value — foam
     // and glint arrive here well over one and are rolled off rather than cut.
-    gl_FragColor = vec4(agxToneMap(col, uExposure), 1.0);
+    // A host that grades the whole frame itself turns this off with
+    // setToneMapped(false) and gets the linear value, unexposed and unclamped.
+    if (uToneMap > 0.5) col = agxToneMap(col, uExposure);
+    gl_FragColor = vec4(col, 1.0);
 
     #include <colorspace_fragment>
   }
@@ -1093,6 +1097,7 @@ export function createOcean(waveField, options = {}) {
     uFoamScale: { value: 1 },
     uRipple: { value: 0.3 },
     uExposure: { value: 1 },
+    uToneMap: { value: 1 },
     // Sea fire. The amount is the gate: at nought the term is a comparison that
     // fails, which is why it is a uniform and not a compile flag — a game may
     // sail from dusk into darkness and the sea must not stop to be rebuilt.
@@ -1321,6 +1326,21 @@ export function createOcean(waveField, options = {}) {
     },
 
     setLighting,
+
+    /**
+     * Whether the water applies exposure and AgX itself (the default).
+     *
+     * Off, the shader writes the assembled scene value as it stands: linear,
+     * unexposed, above one where foam and glint are. That is for a host that
+     * renders into a float target and tone maps the whole frame once, at the
+     * end. It is a uniform, so it can be flipped between frames, and the
+     * default draws exactly what this file drew before it existed.
+     */
+    setToneMapped(on) {
+      uniforms.uToneMap.value = on ? 1 : 0;
+    },
+    get toneMapped() { return uniforms.uToneMap.value > 0.5; },
+
     setPanorama(texture, options) {
       const hadPhoto = uniforms.uSkyPhotoAmount.value > 0;
       setSkyPanorama(uniforms, texture, options);

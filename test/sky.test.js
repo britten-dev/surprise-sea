@@ -280,3 +280,27 @@ test('moonlight stays in sync with the raw reflection and survives partial updat
   assert.equal(sky.uniforms.uMoon.value, 0);
   sky.dispose();
 });
+
+test('the dome tone maps itself unless the host says it will do it', () => {
+  const sky = createSky({ lighting: STORM });
+  assert.equal(sky.toneMapped, true);
+  assert.equal(sky.uniforms.uToneMap.value, 1);
+  const frag = sky.mesh.material.fragmentShader;
+  assert.ok(frag.includes('agxToneMap(col, uExposure)'));
+
+  sky.setToneMapped(false);
+  assert.equal(sky.toneMapped, false);
+  assert.equal(sky.uniforms.uToneMap.value, 0);
+  // A uniform, shared by both domes; no recompile.
+  assert.equal(sky.mesh.material.fragmentShader, frag);
+  sky.setLighting({ exposure: 0.8 });
+  assert.equal(sky.uniforms.uToneMap.value, 0);
+
+  // The reflection cube is linear either way and never reads the switch.
+  const renderer = stubRenderer();
+  sky.updateReflection(renderer, true);
+  const raw = renderer.calls.scenes[0].children[0];
+  assert.equal(raw.material.uniforms, sky.uniforms);
+  assert.ok(!raw.material.fragmentShader.includes('agxToneMap'));
+  sky.dispose();
+});

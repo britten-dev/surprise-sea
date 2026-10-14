@@ -410,3 +410,28 @@ test('moonlight is optional and survives sea-state and partial lighting changes'
   assert.equal(ocean.uniforms.uMoon.value, 0);
   ocean.dispose();
 });
+
+test('the water tone maps itself unless the host says it will do it', () => {
+  const { ocean } = rig();
+  const frag = ocean.mesh.material.fragmentShader;
+  assert.equal(ocean.toneMapped, true);
+  assert.equal(ocean.uniforms.uToneMap.value, 1);
+  // The default is the shader that shipped: exposure and AgX, last of all.
+  assert.ok(frag.includes('agxToneMap(col, uExposure)'));
+  assertUniformsExact(frag, 'tone-mapped sea');
+
+  // Off is a uniform, not a recompile: the same material, the same program.
+  ocean.setToneMapped(false);
+  assert.equal(ocean.toneMapped, false);
+  assert.equal(ocean.uniforms.uToneMap.value, 0);
+  assert.equal(ocean.mesh.material.fragmentShader, frag);
+  ocean.setToneMapped(true);
+  assert.equal(ocean.uniforms.uToneMap.value, 1);
+
+  // It survives lighting changes and rebuilds.
+  ocean.setToneMapped(false);
+  ocean.setLighting({ exposure: 0.8 });
+  ocean.setHullMask(null);
+  assert.equal(ocean.uniforms.uToneMap.value, 0);
+  ocean.dispose();
+});
