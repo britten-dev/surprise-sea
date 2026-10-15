@@ -481,3 +481,14 @@ The same vertex shader samples the same wave field on a coarser or finer mesh;
 CPU height/velocity samples and seakeeping do not change. Hosts should change
 the budget sparingly after sustained performance measurements. The regression
 check is `node --test test/ocean-quality.test.js`.
+
+`setNormalRange`, `setFoamField` and `setDetailCascade` each swap in a new
+shader, and the first frame drawn with it waits while it is built.
+`ocean.materialFor({ normalRange, foamField, cascade })` returns the material
+those calls would produce, without making them, so a host can build its shader
+ahead with `renderer.compile`. Omitted keys stay as they are; a cascade is
+declined exactly as `setDetailCascade` declines one. The live material,
+uniforms and adopted fields do not change. The returned material shares the
+live uniform map and is never drawn; the host keeps it while the shader is
+wanted (three.js deletes a program with the last material that uses it, and
+the sea disposes its own at every switch) and disposes it after.
