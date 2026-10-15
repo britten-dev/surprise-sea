@@ -24,6 +24,13 @@
 // numbers say with the reluctance of five hundred tons, and surfing falls out
 // of the fore-and-aft slope for free.
 //
+// Reluctant toward what, though, matters. Eased toward the water as if it were
+// still, she trails every swell by her time constant: late up the face, still
+// up when the crest has gone by, her forefoot clear of the water. A hull is
+// damped by the water moving past her, so the follow options measure the
+// damping against the sea's own rate instead. She then rides the long swell as
+// a ship does and still smooths whatever is quicker than her taus.
+//
 // Frames: headings are compass bearings (x east, z south, north is −z), which
 // is what the wave table uses. The quaternion is for a mesh whose bow points
 // down its own −Z, three.js's default forward.
@@ -54,6 +61,14 @@ export const HULL_DEFAULTS = {
   pitchTau: 1.9,
   rollTau: 2.1,
   attitudeInertia: false, // opt-in second-order response, retaining angular/heave velocity
+  // How much of the water's own rate each axis is damped against, 0..1. Read
+  // only with attitudeInertia. At 0 the damping is against still air, so she
+  // trails a rising sea by about her tau. At 1 it is against the water, so she
+  // rides the long sea with no lag and smooths only what is quicker than tau.
+  // Roll follows the waves only; heel and the broach are still eased in.
+  heaveFollow: 0,
+  pitchFollow: 0,
+  rollFollow: 0,
 
   // --- Sampling ------------------------------------------------------------
   sampleFore: 0.35, // fore/aft sample arms, as a fraction of length
@@ -175,6 +190,8 @@ export class Hull {
 
     this._rollRate = 0;
     this._attitudeVelocity = { heave: 0, pitch: 0, roll: 0 };
+    this._seaRate = { heave: 0, pitch: 0, roll: 0 };
+    this._seaLast = null;
     this._broachSign = 1;
     this._poopTimer = 0;
     this._poopArmed = true;
@@ -215,6 +232,9 @@ export class Hull {
 
     const px = this.position.x;
     const pz = this.position.z;
+    // Anything but the last step that moved or turned her: a host placing her by hand.
+    const last = this._seaLast;
+    const placed = last !== null && (last.x !== px || last.z !== pz || last.heading !== this.headingRad);
 
     // --- 1. What the water is doing under her -------------------------------
     const foreArm = o.length * o.sampleFore;
@@ -234,11 +254,11 @@ export class Hull {
 
     const targetHeave = (hBow + hStern + hPort + hStar) / 4;
     const targetPitch = Math.atan2(hBow - hStern, foreSpan) * o.pitchGain;
+    const waveRoll = Math.atan2(hPort - hStar, beamSpan) * o.rollGain;
     // Wind loading belongs to the host's sail model. Combine its equilibrium
     // angle with the wave slope before inertia, so rendering, deck immersion,
     // broach recovery and every other hull consumer see the same attitude.
-    let targetRoll = Math.atan2(hPort - hStar, beamSpan) * o.rollGain
-      + (Number.isFinite(heel) ? heel : 0);
+    let targetRoll = waveRoll + (Number.isFinite(heel) ? heel : 0);
 
     // --- 2. Surge, and how hard she is surfing ------------------------------
     // Stern up means she is on the face of a wave that is overtaking her, and
@@ -345,9 +365,10 @@ export class Hull {
     // --- 7. Answer the sea, and move -----------------------------------------
     const prevRoll = this.roll;
     if (o.attitudeInertia) {
-      this._answerSea('heave', targetHeave, o.heaveTau, dt);
-      this._answerSea('pitch', targetPitch, o.pitchTau, dt);
-      this._answerSea('roll', targetRoll, o.rollTau, dt);
+      const rate = this._seaRates(dt, field, placed, targetHeave, targetPitch, waveRoll);
+      this._answerSea('heave', targetHeave, o.heaveTau, dt, o.heaveFollow * rate.heave);
+      this._answerSea('pitch', targetPitch, o.pitchTau, dt, o.pitchFollow * rate.pitch);
+      this._answerSea('roll', targetRoll, o.rollTau, dt, o.rollFollow * rate.roll);
     } else {
       this.heave += (targetHeave - this.heave) * (1 - Math.exp(-dt / o.heaveTau));
       this.pitch += (targetPitch - this.pitch) * (1 - Math.exp(-dt / o.pitchTau));
@@ -363,6 +384,11 @@ export class Hull {
     this.position.z += (fz * this.speed + _orbit.z * o.orbitalDrift) * dt;
     this.position.y = this.heave;
 
+    if (this._seaLast) {
+      this._seaLast.x = this.position.x;
+      this._seaLast.z = this.position.z;
+      this._seaLast.heading = this.headingRad;
+    }
     this._syncTransform();
     return this;
   }
@@ -373,17 +399,50 @@ export class Hull {
     this.onPooped?.(this);
   }
 
-  _answerSea(axis, target, tau, dt) {
-    // Exact critically damped response for a constant target during this tick.
-    // Two poles with tau/2 retain the old low-frequency lag, but a crest cannot
-    // instantaneously reverse the velocity of a heavy hull. No frame-rate gain.
+  /**
+   * How fast the water is moving each wave target, from the last step to this
+   * one. Only ever a rate the sea made: a sea swapped under her, a clock that
+   * jumped, or a hull put somewhere by hand is a jump, and a jump reads as
+   * still water for that step rather than as a shove.
+   */
+  _seaRates(dt, field, placed, heave, pitch, roll) {
+    const o = this.options;
+    const rate = this._seaRate;
+    if (!(o.heaveFollow || o.pitchFollow || o.rollFollow)) {
+      rate.heave = rate.pitch = rate.roll = 0;
+      return rate;
+    }
+    const last = this._seaLast;
+    const time = Number.isFinite(field.time) ? field.time : null;
+    const continuous = last !== null && !placed
+      && last.sea === field.sea
+      && (time === null || last.time === null || Math.abs(time - last.time - dt) <= 1e-6 + 1e-3 * dt);
+    if (continuous) {
+      rate.heave = (heave - last.heave) / dt;
+      rate.pitch = (pitch - last.pitch) / dt;
+      rate.roll = (roll - last.roll) / dt;
+    } else {
+      rate.heave = rate.pitch = rate.roll = 0;
+    }
+    // Where she was sampled from is written after she moves, in update().
+    this._seaLast = { sea: field.sea, time, heave, pitch, roll, x: 0, z: 0, heading: 0 };
+    return rate;
+  }
+
+  _answerSea(axis, target, tau, dt, rate = 0) {
+    // Exact critically damped response through this tick, to a target moving at
+    // `rate` with the damping measured against that motion:
+    //   x'' + 2w x' + w² x = w² T + 2w·rate.
+    // At rate 0 it is the plain ease: two poles at tau/2 keep the old
+    // low-frequency lag, and a crest cannot instantaneously reverse the velocity
+    // of a heavy hull. Either way, no frame-rate gain.
     const omega = 2 / Math.max(0.01, tau);
     const displacement = this[axis] - target;
-    const velocity = this._attitudeVelocity[axis];
+    const velocity = this._attitudeVelocity[axis] - rate;
     const c = velocity + omega * displacement;
     const decay = Math.exp(-omega * dt);
-    this[axis] = target + (displacement + c * dt) * decay;
-    this._attitudeVelocity[axis] = (velocity - omega * c * dt) * decay;
+    this[axis] = target + rate * dt + (displacement + c * dt) * decay;
+    this._attitudeVelocity[axis] = rate + (velocity - omega * c * dt) * decay;
   }
 
   _syncTransform() {

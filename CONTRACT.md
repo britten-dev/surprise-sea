@@ -156,7 +156,13 @@ Model, per update:
    heel from its sail loading model (zero by default). This is combined before
    smoothing and transform generation, so deck immersion and rendering share
    the same attitude. Ease each toward its target with
-   its tau (`1 − exp(−dt/τ)`).
+   its tau (`1 − exp(−dt/τ)`). With `attitudeInertia` the ease is a critically
+   damped pair of poles instead, and `heaveFollow` / `pitchFollow` /
+   `rollFollow` (0..1, default 0) measure its damping against the water's own
+   rate rather than still air: at 1 she rides the long swell without trailing
+   it and smooths only what is quicker than her tau. Roll follows the waves
+   only, never the heel or the broach. A swapped sea, a jumped clock or a hull
+   placed by hand counts as still water for that step, not as a shove.
 2. **Surge/surf**: fore-aft slope under her; stern-up adds speed (surf),
    bow-up subtracts. `surfFactor` 0..1 = how hard she is surfing.
 3. **Rudder authority**: proportional to relative flow past the rudder —
