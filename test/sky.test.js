@@ -304,3 +304,16 @@ test('the dome tone maps itself unless the host says it will do it', () => {
   assert.ok(!raw.material.fragmentShader.includes('agxToneMap'));
   sky.dispose();
 });
+
+test('the sky follows the storm, and the sea can share the very same weather', () => {
+  const sky = createSky({ reflectionSize: 0 });
+  assert.equal(sky.uniforms.uSkyWeather.value.x, 0, 'a sky with no storm asked for should be a grey day');
+  sky.setLighting({ storm: 0.75 });
+  assert.equal(sky.uniforms.uSkyWeather.value.x, 0.75);
+  sky.setLighting({ storm: 4 });
+  assert.equal(sky.uniforms.uSkyWeather.value.x, 1, 'the storm is not clamped');
+  sky.setLighting({ glare: 0.2 });
+  assert.equal(sky.uniforms.uSkyWeather.value.x, 1, 'a partial lighting update dropped the storm');
+  // One uniform row, declared by the shared chunk, read by both shaders.
+  assert.match(sky.mesh.material.fragmentShader, /uniform vec4 uSkyWeather;/);
+});
