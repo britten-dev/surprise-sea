@@ -614,3 +614,17 @@ test('a wake stamper survives a hull with no field under her', () => {
     wake.update(1 / 60);
   });
 });
+
+test('old foam is combed along the wind, without changing how much it spreads', () => {
+  const round = rig('storm', { stretch: 1 }).foam.materials.step.uniforms;
+  const combed = rig('storm', { stretch: 4 }).foam.materials.step.uniforms;
+  assert.equal(round.uStretch.value, 1, 'a stretch of one should be the old round blur');
+  // Square-rooted: the reach along is twice the spread and the reach across
+  // half of it, so their product — the amount of smearing — is unchanged.
+  assert.equal(combed.uStretch.value, 2);
+  // Nothing below one: a stretch of a half would comb the foam across the wind.
+  assert.equal(rig('storm', { stretch: 0.5 }).foam.materials.step.uniforms.uStretch.value, 1);
+  const src = rig().foam.materials.step.fragmentShader;
+  assert.match(src, /uWindDir \* uTexel \* \(uSpread \* uStretch\)/);
+  assert.match(src, /uTexel \* \(uSpread \/ uStretch\)/);
+});
