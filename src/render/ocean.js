@@ -665,7 +665,20 @@ ${features.hullMask ? '    if (hullInterior) discard;' : ''}
     // water is a poor mirror. Full fresnel turns the whole distance to silver.
     float fresnel = 0.02 + 0.5 * pow(1.0 - facing, 5.0);
 
-    vec3 water = uDeep;
+    // The body of the water, with depth in it. Even under a flat grey sky a
+    // wave is lit from above and behind through its own thin top, while the
+    // trough is looking down into fathoms: so the upper half of a swell shows
+    // the green the water is, and the trough the near-black it is over.
+    // Measured in this sea's own standard deviations, so it means crest and
+    // trough in a gale as in a survival sea. Without it the whole sea was one
+    // tint and only the reflected sky gave it any shape, which is much of why
+    // a big sea read as a flat sheet from the masthead.
+    float body = smoothstep(-1.1 * uHeightScale, 1.6 * uHeightScale, vHeight);
+    // Gently: the crest colour is a bright bottle-green, and half of it put
+    // the whole sea into tropical teal. A fifth of it, and the trough a little
+    // over half the deep, keeps the sea's average where the look set it and
+    // only moves light from the troughs to the tops — slate, not lagoon.
+    vec3 water = mix(uDeep * 0.55, mix(uDeep, uCrestGlow, 0.2) * 1.15, body);
 ${features.hullMask ? `
     // Bubbles below the surface soften the green water before they become
     // white surface foam. They still receive its reflections and highlights.
