@@ -49,7 +49,7 @@
 // without a single number being touched.
 
 import * as THREE from 'three';
-import { waveUniforms, oceanVertexChunk, oceanNormalChunk } from '../seastate.js';
+import { waveUniforms, oceanVertexChunk, oceanNormalChunk, oceanCrestChunk } from '../seastate.js';
 import { warpedGrid } from './grid.js';
 import { cascadeSamplingChunk } from './cascade-sampling.js';
 import { hullWaveChunk, hullWashChunk } from './hull-flow.js';
@@ -386,7 +386,7 @@ export const agxToneMapChunk = /* glsl */ `
  * it ran before any of them existed, down to the uniform declarations.
  */
 const fragmentShader = (waveCount, normalRange, detailCount, features = {}) => /* glsl */ `
-  ${normalRange > 0 ? oceanNormalChunk(waveCount) : ''}
+  ${normalRange > 0 ? oceanNormalChunk(waveCount) + oceanCrestChunk() : ''}
   ${detailCount > 0 ? detailNormalChunk(detailCount) : ''}
   ${skyGradientChunk}
   ${features.panorama ? skyPanoramaChunk : ''}
@@ -512,6 +512,36 @@ ${detailCount > 0 ? `  // The same octave folded about its own middle, which tur
   // patches: it lies in lace, thick along the folds and thin between them.
   float veins(vec2 p) {
     return 1.0 - abs(noise(p) * 2.0 - 1.0);
+  }
+
+  // Broken water is not a veil. It is a raft of bubbles: solid white while it
+  // is fresh, and as it ages the cells open into a net of white walls round
+  // dark holes. This is that net — nought along the walls, rising to one in
+  // the middle of each hole — so that a coverage can be cut against it: a thin
+  // coverage keeps only the walls, a full one fills the holes in. Cut that way,
+  // half-faded foam reads as lace on the water instead of as grey fog on it.
+  // Hoskins' sine-free hash: eighteen of these run per foamed pixel, and a
+  // sine each is what made the net cost as much as the rest of the foam.
+  vec2 hash2(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+  }
+  float foamCells(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    float f1 = 9.0;
+    float f2 = 9.0;
+    for (int y = -1; y <= 1; y++) {
+      for (int x = -1; x <= 1; x++) {
+        vec2 g = vec2(float(x), float(y));
+        vec2 o = g + hash2(i + g) - f;
+        float d = dot(o, o);
+        f2 = min(f2, max(f1, d));
+        f1 = min(f1, d);
+      }
+    }
+    return clamp((sqrt(f2) - sqrt(f1)) * 1.5, 0.0, 1.0);
   }` : ''}
 
   void main() {
@@ -529,12 +559,18 @@ ${features.hullMask ? '    bool hullInterior = insideHull(vWorldPos);' : ''}
     // against the pixel and the difference stops being visible.
     vec3 n = vNormal;
     float nearAmt = 0.0;
+    // The crest pinch everything below keys off: the foam threshold, the glow
+    // through thin water, the shade under a fold. The vertex value, unless this
+    // pixel is near enough to be given the real one.
+    float crestNow = vCrest;
 ${normalRange > 0 ? `
     nearAmt = 1.0 - smoothstep(${(normalRange * 0.55).toFixed(1)}, ${normalRange.toFixed(1)}, dist);
     if (nearAmt > 0.002) {
       // Horizontal range, to match the attenuation the vertex stage applied.
       float camDistF = distance(vUndisp, uCameraPos.xz);
-      vec3 nf = gerstnerNormal(vUndisp, camDistF, uTime);${detailCount > 0 ? `
+      float crestF;
+      vec3 nf = gerstnerNormalCrest(vUndisp, camDistF, uTime, crestF);
+      crestNow = mix(vCrest, crestF, nearAmt);${detailCount > 0 ? `
       // The wavelets, where a pixel can hold one. The same sum the vertex
       // stage displaced by, evaluated at the same datum footprint — but carried
       // an order of magnitude further out, because a pixel resolves half a
@@ -652,7 +688,7 @@ ${features.hullMask ? `
     //             flat one presents its whole depth and reads as deep.
     float forward = max(0.0, dot(viewDir, -sun));
     float lobe = 0.35 * forward * forward + 0.65 * pow(forward, 8.0);
-    float thin = smoothstep(0.45, 1.0, vCrest / max(uFoamHi, 1e-4));
+    float thin = smoothstep(0.45, 1.0, crestNow / max(uFoamHi, 1e-4));
     float lifted = smoothstep(0.19 * uHeightScale, 1.23 * uHeightScale, vHeight);
     float lean = smoothstep(0.0, 0.45, 1.0 - n.y);
     float sss = lobe * lifted * (0.35 + 0.65 * thin) * (0.5 + 0.5 * lean);
@@ -678,7 +714,7 @@ ${detailCount > 0 ? `
     // detailed one: this is about which face of a wave a pixel is on, and the
     // wavelets have no opinion worth having about that.
     float pinchBand = max(uFoamHi - uFoamLo, 1e-4);
-    float underFold = smoothstep(uFoamLo - 0.35 * pinchBand, uFoamLo + 0.55 * pinchBand, vCrest)
+    float underFold = smoothstep(uFoamLo - 0.35 * pinchBand, uFoamLo + 0.55 * pinchBand, crestNow)
                     * clamp(dot(vNormal.xz, uWindDir) * 3.5, 0.0, 1.0)
                     * (1.0 - smoothstep(45.0, 190.0, dist))
                     * uDetail;
@@ -717,7 +753,7 @@ ${features.reflection ? `
     // this broken could show anyway.
     if (uSkyReflAmount > 0.0) {
       float rough = clamp(0.3 + uRipple * 1.4
-                        + 0.9 * smoothstep(0.0, uFoamHi, vCrest), 0.0, 1.0);
+                        + 0.9 * smoothstep(0.0, uFoamHi, crestNow), 0.0, 1.0);
       skyCol = mix(skyCol, textureCube(uSkyRefl, reflDir, rough * 5.0).rgb,
                    uSkyReflAmount);
     }
@@ -783,7 +819,31 @@ ${features.hullTransmission ? `
     // Faded hard with distance, or every far crest becomes a solid white bar —
     // the field's scars included, since they are the same white water.
     float rag = fbm(vUndisp * 0.13 * uFoamScale + uWindDir * uTime * -0.5);
-    float crestFoam = smoothstep(uFoamLo, uFoamHi, vCrest + (rag - 0.5) * uFoamJitter);${features.foamField ? `
+    float crestFoam = smoothstep(uFoamLo, uFoamHi, crestNow + (rag - 0.5) * uFoamJitter);
+
+    // The wind's comb. Above a gale, the Beaufort scale's own words are foam
+    // "blown in well-marked streaks along the direction of the wind": the white
+    // a crest throws down does not lie where it fell, it is drawn out downwind
+    // in lines a metre or two across and tens of metres long. This is the
+    // shape of those lines — fine across the wind, long along it, creeping
+    // downwind with the surface drift. It is a shape, not a source: on its own
+    // it whitens nothing, and it only ever decides *where* old foam goes.
+    // Where it is finer than a pixel it is handed back as its own average,
+    // or the lines would shimmer into a moiré at range.
+    //
+    // Real streaks are not ruled lines. They wander a little across the wind
+    // and they break up along it, so the lines are bent by a slow meander and
+    // cut into dashes a dozen metres long; left straight and whole they read
+    // as scratches on the screen rather than as anything on the water.
+    vec2 windPerp = vec2(-uWindDir.y, uWindDir.x);
+    float across = dot(vUndisp, windPerp) * uFoamScale;
+    float downwind = dot(vUndisp, uWindDir) * uFoamScale;
+    float meander = (noise(vUndisp * 0.018 * uFoamScale) - 0.5) * 4.0;
+    vec2 combP = vec2((across + meander) * 0.5, downwind * 0.045 - uTime * 0.035);
+    float combPixel = fwidth(combP.x);
+    float lines = smoothstep(0.54, 0.78, fbm(combP));
+    float dashes = smoothstep(0.38, 0.72, noise(vec2(across * 0.11, downwind * 0.085 - uTime * 0.05)));
+    float comb = mix(lines * dashes, 0.12, smoothstep(0.3, 0.9, combPixel));${features.foamField ? `
 
     // What this piece of sea remembers. Sampled at the datum footprint, which
     // is where the field's own pass evaluated the crest sum, so the scar and the
@@ -798,7 +858,12 @@ ${features.hullTransmission ? `
     // Squared, not linear: a half-faded memory should read as lace on the
     // water, not as half a coat of paint. Fresh white is still fresh white.
     float ffScar = texture2D(uFoamField, ffUv).r;
-    crestFoam = max(crestFoam, ffScar * ffScar * uFoamAmount * ffFade);` : ''}
+    // And combed: the memory is where the old foam is, the comb is the shape
+    // the wind has dragged it into. Gathered into the lines rather than spread
+    // evenly, so a patch a crest left behind half a minute ago is a set of
+    // streaks running away from it and not a stain round it.
+    float memory = ffScar * ffScar * uFoamAmount * ffFade;
+    crestFoam = max(crestFoam, memory * (0.3 + 0.9 * comb));` : ''}
 ${features.wakeField ? `
     // Wake stamps are recorded at world positions along the sailed track.
     // Sample displaced positions too, so a passing wave cannot pull a patch
@@ -817,20 +882,6 @@ ${features.wakeField ? `
     float wakeResolved = 1.0 - smoothstep(0.25, 0.8, wakePixel);
     float wakeTexture = mix(0.65, 0.35 + 0.65 * fbm(wakeGrain), wakeResolved);
     crestFoam = max(crestFoam, wakeScar * wakeScar * wakeTexture);
-` : ''}
-${detailCount > 0 ? `
-    // Break up the wash gently. High-contrast sub-metre ridges plus a second
-    // hard threshold made persistent wake foam flash as a 30 fps chase camera
-    // crossed it. Keep the stored coverage and give it broad, filtered texture.
-    float laceAmt = (1.0 - smoothstep(40.0, 165.0, dist)) * uDetail;
-    if (laceAmt > 0.004) {
-      vec2 lp = vUndisp * 0.42 * uFoamScale + uWindDir * uTime * -0.22;
-      float footprint = max(length(dFdx(lp)), length(dFdy(lp)));
-      float resolved = 1.0 - smoothstep(0.25, 0.8, footprint);
-      float lacework = mix(0.5, fbm(lp), resolved);
-      float mids = 4.0 * crestFoam * (1.0 - crestFoam);
-      crestFoam = clamp(crestFoam + (lacework - 0.5) * mids * laceAmt * 0.28, 0.0, 1.0);
-    }
 ` : ''}${features.cascade ? `
     // The tile's own micro foam: the steepest facets in the wavelet field,
     // which is where a wind sea goes white at a scale no crest sum could reach.
@@ -842,17 +893,44 @@ ${detailCount > 0 ? `
     crestFoam = clamp(
       crestFoam + cascFoam * uCascadeFoam * (0.25 + 0.75 * crestFoam), 0.0, 1.0);
 ` : ''}
+${detailCount > 0 ? `
+    // Cut the coverage into the bubble net (see foamCells). The derivatives are
+    // taken before the branch, where every fragment is still in step; past the
+    // range at which a cell is a few pixels across, the net would only sparkle,
+    // so it hands the coverage back untouched, which is the net's own average.
+    vec2 cellP = vUndisp * 0.55 * uFoamScale;
+    float cellPixel = max(fwidth(cellP.x), fwidth(cellP.y));
+    float laceAmt = (1.0 - smoothstep(0.12, 0.4, cellPixel)) * uDetail;
+    if (laceAmt > 0.004) {
+      // Below about a twentieth the cut below keeps nothing at all, so there
+      // is no net worth working out: that faint wash is simply taken away,
+      // which is the same answer for a fraction of the price.
+      if (crestFoam < 0.05) {
+        crestFoam *= 1.0 - laceAmt;
+      } else {
+        // Warped first, or the walls come out as straight-edged polygons and
+        // the foam reads as chicken wire; then two sizes of hole, because a
+        // raft of foam has big ones and small ones.
+        vec2 warp = vec2(noise(cellP * 0.6), noise(cellP * 0.6 + 7.3)) - 0.5;
+        vec2 wp = cellP + warp * 1.1;
+        float cells = foamCells(wp) * 0.6 + foamCells(wp * 2.37 + 17.0) * 0.4;
+        float soft = 0.05 + cellPixel * 0.5;
+        // A shade over one, so a crest that is solid white by the threshold
+        // above is solid white here too and not riddled with pinholes.
+        float lace = smoothstep(cells - soft, cells + soft, crestFoam * 1.18 - 0.06);
+        crestFoam = mix(crestFoam, lace, laceAmt);
+      }
+    }
+` : ''}
     crestFoam *= 0.22 + 0.78 * exp(-dist / 5500.0);
 
-    // Spindrift: old foam drawn out downwind in long lace streaks — narrow
-    // across the wind, long along it, broken up so it never reads as sheets.
-    vec2 windPerp = vec2(-uWindDir.y, uWindDir.x);
-    vec2 sp = vec2(dot(vUndisp, windPerp) * 0.11 * uFoamScale,
-                   dot(vUndisp, uWindDir) * 0.008 * uFoamScale - uTime * 0.05);
-    float lace = fbm(vUndisp * 0.6 * uFoamScale + sp);
-    float streaks = smoothstep(0.62, 0.88, fbm(sp)) * (0.35 + 0.65 * lace);
-    streaks *= smoothstep(-0.28 * uHeightScale, 0.47 * uHeightScale, vHeight)
-             * uSpindrift * exp(-dist / 2600.0);
+    // Spindrift: in a big enough wind the comb shows even where no single crest
+    // left anything to drag — the whole sea is streaked. Only from a gale up
+    // (uSpindrift is nought below one), only on the upper half of the swell,
+    // where the wind is getting at the water, and kept well under the foam the
+    // crests themselves make.
+    float streaks = comb * smoothstep(-0.28 * uHeightScale, 0.47 * uHeightScale, vHeight)
+                  * uSpindrift * 0.3 * exp(-dist / 1800.0);
 
     float foam = clamp(crestFoam + streaks, 0.0, 1.0);
 ${features.hullMask ? `

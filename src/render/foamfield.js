@@ -63,8 +63,17 @@ const DEFAULTS = {
   // read. Sea of Thieves does exactly this and it is nearly free: four bilinear
   // taps, and the scar softens a little every pass instead of staying a hard
   // stencil of the crest that made it. It is diffusion rather than a filter —
-  // see the square root in `update`.
-  spread: 0.6,
+  // see the square root in `update`. 0.6 was the first cut, and diffusion adds
+  // up: by its fourth second a scar had spread thirty metres every way and the
+  // sea wore its broken water as soft grey fog. 0.35, and pulled out along the
+  // wind (below), keeps a patch near the size of the crest that made it.
+  spread: 0.35,
+  // How much further the blur reaches along the wind than across it. Old foam
+  // does not spread like ink; the wind combs it into streaks, so it is drawn
+  // out downwind and stays narrow across. One is the old round blur; the
+  // product of the two reaches is kept, so this shapes the smear without
+  // changing how much of it there is.
+  stretch: 3.5,
   // Gain on the analytic injection; 0 leaves only the stamps. Deliberately
   // well under one: the ocean paints the *instantaneous* break at full white
   // by itself, so the field's job is only the aftermath — and through the
@@ -127,6 +136,7 @@ const stepFragment = (waveCount) => /* glsl */ `
   uniform vec2 uSrcOffset;   // where this texel's history was last pass, in uv
   uniform vec2 uTexel;       // 1 / size
   uniform float uSpread;     // feedback blur, in texels
+  uniform float uStretch;    // how much longer it reaches downwind than across
   uniform float uDecay;      // 2^(-dt/halfLife)
   uniform float uInject;     // gain on the analytic injection
   uniform float uFoamLo;     // pinch at which a crest starts to break
@@ -163,13 +173,15 @@ const stepFragment = (waveCount) => /* glsl */ `
     vec2 src = vUv + uSrcOffset;
 
     // Four bilinear taps rather than one: the history softens as it ages
-    // instead of holding the stencil of the crest that made it.
-    vec2 o = uTexel * uSpread;
+    // instead of holding the stencil of the crest that made it — and softens
+    // along the wind more than across it, so it ages into streaks.
+    vec2 along = uWindDir * uTexel * (uSpread * uStretch);
+    vec2 across = vec2(-uWindDir.y, uWindDir.x) * uTexel * (uSpread / uStretch);
     float history =
-      (texture2D(uPrev, src + vec2( o.x,  o.y)).r +
-       texture2D(uPrev, src + vec2(-o.x,  o.y)).r +
-       texture2D(uPrev, src + vec2( o.x, -o.y)).r +
-       texture2D(uPrev, src + vec2(-o.x, -o.y)).r) * 0.25;
+      (texture2D(uPrev, src + along + across).r +
+       texture2D(uPrev, src - along + across).r +
+       texture2D(uPrev, src + along - across).r +
+       texture2D(uPrev, src - along - across).r) * 0.25;
 
     // Water that has just scrolled in over the leading edge has no history, and
     // must not be given the edge texel's. Clean sea comes in clean.
@@ -252,7 +264,7 @@ const stampFragment = /* glsl */ `
  *                   thresholds, and its `time` the clock — so the injection can
  *                   never be a different instant from the mesh it whitens.
  * @param options    `{ size, extent, halfLife, windFromDeg, drift, windDrift,
- *                      spread, inject, maxStamps }`, and `format` for anyone
+ *                      spread, stretch, inject, maxStamps }`, and `format` for anyone
  *                   whose GPU will not render a single-channel half float.
  *
  * @returns `{ update(renderer, dt, cameraPos), stamp(x, z, radius, strength),
@@ -332,6 +344,9 @@ export function createFoamField(waveField, options = {}) {
     uSrcOffset: { value: new THREE.Vector2() },
     uTexel: { value: new THREE.Vector2(1 / size, 1 / size) },
     uSpread: { value: o.spread },
+    // Square-rooted, so the reach along times the reach across is the spread
+    // squared whatever the stretch: the shape changes, the amount does not.
+    uStretch: { value: Math.sqrt(Math.max(1, o.stretch)) },
     uDecay: { value: 0 },
     uInject: { value: o.inject },
     uFoamLo: { value: 0.33 },
