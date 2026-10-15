@@ -1276,15 +1276,16 @@ export function createOcean(waveField, options = {}) {
   };
 
   // Nought disables the near-field normal pass; anything else is a range in
-  // metres, and the shader is generated around it.
-  const normalRange = Math.max(0, quality.normalRange ?? 0);
+  // metres, and the shader is generated around it. `setNormalRange` moves it
+  // under a running sea.
+  let normalRange = Math.max(0, quality.normalRange ?? 0);
 
   // The wavelet table rides on the same switch, and for the same reason: it is
   // a second wave loop in both stages, and a machine that cannot afford the
   // first one per pixel certainly cannot afford this. Nought compiles every
   // line of render/detail.js out of both shaders — no arrays, no loop, no
   // uniform declared — and what is left is the phone path unchanged.
-  const detailCount = normalRange > 0 ? DETAIL_COUNT : 0;
+  let detailCount = normalRange > 0 ? DETAIL_COUNT : 0;
 
   // Built either way — it is a dozen sines' worth of arithmetic and a caller
   // may want to read the budget back — but only uploaded where it is compiled.
@@ -1305,6 +1306,9 @@ export function createOcean(waveField, options = {}) {
   let wakeField = null;
   let reflection = null;
   let cascade = null;
+  // The cascade last handed over, kept even while it is declined, so that a
+  // near field switched off and on again gets it back.
+  let offeredCascade = null;
   let hullMask = null;
   let shipReflection = null;
   let hullTransmission = null;
@@ -1354,6 +1358,7 @@ export function createOcean(waveField, options = {}) {
    */
   function adoptCascade(next) {
     for (const key of CASCADE_UNIFORMS) delete uniforms[key];
+    offeredCascade = next ?? null;
     cascade = next && !next.disabled && normalRange > 0 ? next : null;
     if (!cascade) return;
     for (const key of CASCADE_UNIFORMS) {
@@ -1567,10 +1572,47 @@ export function createOcean(waveField, options = {}) {
      * workbench and the eye can be asked the only question that matters, which
      * is whether the water is better with them than without. It is a uniform,
      * not a recompile, so it can be animated; to be rid of the cost as well as
-     * the look, build with `quality.normalRange` at nought.
+     * the look, use `setNormalRange(0)`.
      */
     setDetail(amount) {
       uniforms.uDetail.value = clamp(amount ?? 1, 0, 1);
+    },
+
+    /**
+     * Move the near field under a running sea, cost and all.
+     *
+     * Nought is the sea `quality.normalRange` at nought would have built: no
+     * per-pixel normal, no wavelets, no lace, no fold-shadow, and no cascade,
+     * byte for byte the same shader. Anything else brings them back, with the
+     * cascade last handed over if there was one. It is for a game whose frame
+     * rate has collapsed, and it costs one shader compile each way and nothing
+     * when the range has not changed. The water the physics samples is the
+     * same either way: the wavelets are the only thing in here that moves a
+     * vertex, and they are for the eye alone.
+     *
+     * @param metres  how far out the fragment stage re-evaluates the normal.
+     * @returns the range now in force.
+     */
+    setNormalRange(metres) {
+      if (!Number.isFinite(metres)) throw new TypeError('normal range must be finite');
+      const next = Math.max(0, metres);
+      if (next === normalRange) return normalRange;
+      const wasOn = normalRange > 0;
+      normalRange = next;
+      if (wasOn !== normalRange > 0) {
+        detailCount = normalRange > 0 ? DETAIL_COUNT : 0;
+        const table = detailUniforms(detail);
+        if (detailCount > 0) Object.assign(uniforms, table);
+        else for (const key of Object.keys(table)) delete uniforms[key];
+        adoptCascade(offeredCascade);
+      }
+      rebuild();
+      return normalRange;
+    },
+
+    /** The near-field range in force, in metres; nought when it is compiled out. */
+    get normalRange() {
+      return normalRange;
     },
 
     /**
