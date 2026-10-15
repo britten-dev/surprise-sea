@@ -317,3 +317,22 @@ test('the sky follows the storm, and the sea can share the very same weather', (
   // One uniform row, declared by the shared chunk, read by both shaders.
   assert.match(sky.mesh.material.fragmentShader, /uniform vec4 uSkyWeather;/);
 });
+
+test('the clouds ride the wind aloft, and a bad step or wind moves nothing', () => {
+  const sky = createSky({ reflectionSize: 0 });
+  // Thirty seconds of a 25 m/s wind blowing toward +x.
+  for (let i = 0; i < 1800; i++) sky.update(1 / 60, { x: 25, z: 0 });
+  const drift = sky.cloudDrift;
+  assert.ok(Math.abs(drift.x - 25 * 1.6 * 30) < 1e-6 * 1200 + 0.01, `drifted ${drift.x} m`);
+  assert.equal(drift.z, 0);
+  // Integrated, not clocked: the same distance at thirty hertz.
+  const slow = createSky({ reflectionSize: 0 });
+  for (let i = 0; i < 900; i++) slow.update(1 / 30, { x: 25, z: 0 });
+  assert.ok(Math.abs(slow.cloudDrift.x - drift.x) < 0.01);
+  // Nothing poisons the drift.
+  for (const [dt, wind] of [[NaN, { x: 1, z: 1 }], [-1, { x: 1, z: 1 }], [1 / 60, { x: NaN, z: 0 }], [1 / 60, null]]) {
+    sky.update(dt, wind);
+  }
+  assert.ok(Number.isFinite(sky.cloudDrift.x) && Number.isFinite(sky.cloudDrift.z));
+  assert.ok(Math.abs(sky.cloudDrift.x - drift.x) < 1e-9, 'a bad step moved the clouds');
+});

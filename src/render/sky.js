@@ -58,6 +58,22 @@ const DEFAULT_LIGHTING = {
  */
 const REFLECTION_SIZE = 128;
 
+/**
+ * The wind the clouds ride, over the wind at the sea. Wind strengthens with
+ * height and the deck is a mile up; half again as much again is the usual
+ * rule of thumb over open water, and it is what makes scud race.
+ */
+const CLOUD_WIND = 1.6;
+
+/**
+ * Seconds between re-renders of the reflection cube while the clouds move. The
+ * cube is what the water mirrors and what lights the ship, and a storm sea
+ * blurs it past reading individual clouds, so twice a second is plenty. A
+ * re-render measured about a millisecond at 256 a face on an M2 Max, so this
+ * costs a twentieth of a millisecond a frame on average.
+ */
+const REFLECTION_REFRESH = 0.5;
+
 /** Hex numbers, CSS strings and THREE.Colors are all fair game for a palette. */
 function readColour(out, value) {
   if (value === undefined || value === null) return out;
@@ -135,7 +151,8 @@ ${graded ? `
  *                     one entirely.
  *
  * @returns `{ mesh, uniforms, reflection, updateReflection(renderer),
- *            setLighting(lighting), dispose() }`
+ *            update(dt, wind, renderer), cloudDrift, setLighting(lighting),
+ *            dispose() }`
  *
  * `reflection` is null until `updateReflection` has been handed a renderer
  * once. Ask for it after that call, not before.
@@ -192,6 +209,7 @@ export function createSky(options = {}) {
   // flag: `setLighting` sets it, `updateReflection` clears it, and a caller who
   // calls updateReflection every frame re-renders nothing at all.
   let stale = true;
+  let sinceRefresh = 0;
 
   function buildReflection(renderer) {
     if (cubeTarget || size <= 0) return;
@@ -248,6 +266,16 @@ export function createSky(options = {}) {
 
   setLighting(options.lighting ?? {});
 
+  function updateReflection(renderer, force = false) {
+    if (size <= 0 || !renderer || typeof renderer.render !== 'function') return null;
+    buildReflection(renderer);
+    if (!stale && !force) return cubeTarget.texture;
+
+    cubeCamera.update(renderer, cubeScene);
+    stale = false;
+    return cubeTarget.texture;
+  }
+
   return {
     mesh,
     uniforms,
@@ -281,14 +309,42 @@ export function createSky(options = {}) {
      *
      * @returns the cube texture, or null if there is nothing to render into.
      */
-    updateReflection(renderer, force = false) {
-      if (size <= 0 || !renderer || typeof renderer.render !== 'function') return null;
-      buildReflection(renderer);
-      if (!stale && !force) return cubeTarget.texture;
+    updateReflection,
 
-      cubeCamera.update(renderer, cubeScene);
-      stale = false;
-      return cubeTarget.texture;
+    /**
+     * Move the clouds. The wind is the wind at the sea, in metres a second on
+     * the xz plane (anything with `x` and `z`); the clouds ride CLOUD_WIND
+     * times that, downwind, the deck at its height and the scud below it three
+     * times as fast across the sky because it is nearer. Drift is integrated
+     * here rather than computed from a clock, so a wind that swings or
+     * strengthens turns the clouds instead of jumping them.
+     *
+     * Hand it the renderer and the reflection cube follows the clouds, re-drawn
+     * every REFLECTION_REFRESH seconds while they move and never while they do
+     * not. A bad step or a bad wind moves nothing.
+     */
+    update(dt, wind, renderer) {
+      if (!(dt > 0) || !Number.isFinite(dt)) return;
+      const wx = wind?.x ?? 0;
+      const wz = wind?.z ?? 0;
+      if (!Number.isFinite(wx) || !Number.isFinite(wz)) return;
+      const weather = uniforms.uSkyWeather.value;
+      weather.y += wx * CLOUD_WIND * dt;
+      weather.z += wz * CLOUD_WIND * dt;
+      if (wx !== 0 || wz !== 0) {
+        sinceRefresh += dt;
+        if (sinceRefresh >= REFLECTION_REFRESH) {
+          sinceRefresh = 0;
+          stale = true;
+        }
+      }
+      if (renderer) updateReflection(renderer);
+    },
+
+    /** How far the clouds have drifted, in metres. */
+    get cloudDrift() {
+      const w = uniforms.uSkyWeather.value;
+      return { x: w.y, z: w.z };
     },
 
     dispose() {
