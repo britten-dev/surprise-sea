@@ -91,8 +91,11 @@ Queries (all take explicit `t` seconds):
 - `heightAt(x, z, t)` — exact surface height in the column above (x,z):
   3 fixed-point iterations inverting the Gerstner horizontal displacement,
   then the vertical sum. This is the authoritative surface.
-- `roughHeightAt(x, z, t)` — vertical terms only, no inversion. For spray,
-  birds, anything decorative.
+- `roughHeightAt(x, z, t)` — vertical terms only, no inversion. For things
+  far from the eye, or that only need a ballpark (an altitude). It is the
+  height of the water that *started* at (x,z), which on a storm crest is
+  metres from the water drawn there — up to ~5 m in `storm`. Spray near the
+  eye tracks the true surface instead (`render/spray.js`, `trackSurface`).
 - `gradientAt(x, z, t, spread = 22)` — finite differences of `heightAt`.
 - `normalAt(x, z, t, spread, out?)` — from the gradient, THREE.Vector3.
 - `crestAt(x, z, t)` — Σ q·k·A·sin(θ): how pinched the surface is; foam and
