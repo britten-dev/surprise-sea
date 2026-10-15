@@ -10,6 +10,7 @@ import {
   waveUniforms,
   oceanVertexChunk,
   oceanNormalChunk,
+  oceanCrestChunk,
   FOAM_LAGS,
 } from '../src/seastate.js';
 
@@ -482,4 +483,26 @@ test('a SeaState can be built straight from components', () => {
   assert.equal(sea.preset, 'hand-made');
   assert.equal(sea.windSpeed, 12);
   assert.ok(Math.abs(sea.waves[0].q * sea.waves[0].k * 2 - 0.2) < 1e-12);
+});
+
+test('the fragment crest chunk is the vertex crest, memory and all, beside the same normal', () => {
+  const chunk = oceanCrestChunk();
+  // It joins a stage that already owns the wave table: declaring any of it
+  // again would be a compile error, and declaring a uniform of its own would
+  // be one nobody uploads.
+  assert.ok(!/\buniform\b/.test(chunk), 'the crest chunk should declare nothing');
+  assert.ok(!chunk.includes('#define NW'), 'the crest chunk should not redefine the table');
+  assert.match(chunk, /vec3 gerstnerNormalCrest\(vec2 p, float camDist, float t, out float crestOut\)/);
+  // The same attenuation as both other stages, so it describes the same sea.
+  assert.match(chunk, /exp\(-camDist \/ \(uWaveLen\[i\] \* 45\.0 \+ 600\.0\)\)/);
+  // Every lag the vertex stage remembers, at the same weight, or the white a
+  // pixel shows would not be the white the foam field and the CPU agree on.
+  for (const { lag, weight } of FOAM_LAGS) {
+    const l = Number.isInteger(lag) ? lag.toFixed(1) : String(lag);
+    const w = Number.isInteger(weight) ? weight.toFixed(1) : String(weight);
+    assert.ok(chunk.includes(`uWaveOmega[i] * ${l})`), `lag ${lag} is missing`);
+    assert.ok(chunk.includes(`* ${w})`), `weight ${weight} is missing`);
+  }
+  // And no position: it is shading only.
+  assert.ok(!chunk.includes('pos'), 'the crest chunk should not displace anything');
 });

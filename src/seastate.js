@@ -340,14 +340,14 @@ function waveArrayDeclarations(waveCount) {
  *
  * @param waveCount  must match `seaState.waves.length`.
  */
-export function oceanVertexChunk(waveCount = 12) {
+function crestLagChunks() {
   const lagDecl = FOAM_LAGS.map((_, i) => `    float crestLag${i} = 0.0;`).join('\n');
 
   // θ(t − τ) = k·d·p − ω(t − τ) + φ = θ(t) + ω·τ. So a lagged crest sum costs
   // one extra sine per wave, not another pass over the table.
   const lagSums = FOAM_LAGS.map(
     ({ lag }, i) =>
-      `      crestLag${i} += qka * sin(theta + uWaveOmega[i] * ${glslFloat(lag)});  // uTime - ${glslFloat(lag)}`
+      `      crestLag${i} += qka * sin(theta + uWaveOmega[i] * ${glslFloat(lag)});  // ${glslFloat(lag)} s ago`
   ).join('\n');
 
   // Nested, because GLSL's max takes two arguments however many lags there are.
@@ -355,6 +355,11 @@ export function oceanVertexChunk(waveCount = 12) {
     (acc, { weight }, i) => `max(${acc}, crestLag${i} * ${glslFloat(weight)})`,
     'crest'
   );
+  return { lagDecl, lagSums, lagFold };
+}
+
+export function oceanVertexChunk(waveCount = 12) {
+  const { lagDecl, lagSums, lagFold } = crestLagChunks();
 
   return /* glsl */ `
   ${waveArrayDeclarations(waveCount)}
@@ -445,6 +450,60 @@ export function oceanNormalChunk(waveCount = 12) {
       normal.y -= uWaveQ[i] * ka * sin(theta);
     }
 
+    return normalize(normal);
+  }
+`;
+}
+
+/**
+ * The fragment-stage twin of the crest half of `gerstner`, memory and all,
+ * computed alongside the per-pixel normal.
+ *
+ * The vertex crest is exact where it is computed and mush in between, exactly
+ * as the normal was: a whitecap is cut by a threshold on this number, and a
+ * threshold on a value interpolated across a cell six metres wide draws a soft
+ * smear the shape of the triangle rather than a crest. Evaluated per pixel, the
+ * white stops where the surface really stops pinching, which is what makes a
+ * breaking top read as a hard white edge on grey water and not as fog sitting
+ * on it.
+ *
+ * It declares nothing. It joins a stage that has already included
+ * `oceanNormalChunk`, which owns the wave table, and it takes the clock as a
+ * parameter for the same reason that one does. Like it, it is shading only:
+ * no position comes out of it, so the surface a hull floats on is untouched.
+ */
+export function oceanCrestChunk() {
+  const { lagDecl, lagSums, lagFold } = crestLagChunks();
+  return /* glsl */ `
+  // gerstnerNormal and the crest in one pass over the table: the attenuation
+  // and the phase are the expensive part of either, and they are the same
+  // numbers. The normal is the sum gerstnerNormal returns, term for term.
+  vec3 gerstnerNormalCrest(vec2 p, float camDist, float t, out float crestOut) {
+    vec3 normal = vec3(0.0, 1.0, 0.0);
+    float crest = 0.0;
+${lagDecl}
+
+    for (int i = 0; i < NW; i++) {
+      float att = exp(-camDist / (uWaveLen[i] * 45.0 + 600.0));
+      float amp = uWaveAmp[i] * att;
+      if (amp < 0.001) continue;
+
+      vec2 d = uWaveDir[i];
+      float theta = uWaveK[i] * dot(d, p) - uWaveOmega[i] * t + uWavePhase[i];
+      float s = sin(theta);
+      float c = cos(theta);
+      float ka = uWaveK[i] * amp;
+      float qka = uWaveQ[i] * ka;
+
+      normal.x -= d.x * ka * c;
+      normal.z -= d.y * ka * c;
+      normal.y -= qka * s;
+
+      crest += qka * s;
+${lagSums}
+    }
+
+    crestOut = ${lagFold};
     return normalize(normal);
   }
 `;

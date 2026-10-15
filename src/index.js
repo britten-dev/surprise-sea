@@ -10,6 +10,7 @@ export {
   waveUniforms,
   oceanVertexChunk,
   oceanNormalChunk,
+  oceanCrestChunk,
   FOAM_LAGS,
 } from './seastate.js';
 export { WaveField } from './wavefield.js';
