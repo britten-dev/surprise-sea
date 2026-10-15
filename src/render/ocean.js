@@ -563,13 +563,15 @@ ${features.hullMask ? '    bool hullInterior = insideHull(vWorldPos);' : ''}
     // through thin water, the shade under a fold. The vertex value, unless this
     // pixel is near enough to be given the real one.
     float crestNow = vCrest;
+    // And what it will be in a moment, where the pixel can be given that too.
+    float crestLead = 0.0;
 ${normalRange > 0 ? `
     nearAmt = 1.0 - smoothstep(${(normalRange * 0.55).toFixed(1)}, ${normalRange.toFixed(1)}, dist);
     if (nearAmt > 0.002) {
       // Horizontal range, to match the attenuation the vertex stage applied.
       float camDistF = distance(vUndisp, uCameraPos.xz);
       float crestF;
-      vec3 nf = gerstnerNormalCrest(vUndisp, camDistF, uTime, crestF);
+      vec3 nf = gerstnerNormalCrest(vUndisp, camDistF, uTime, crestF, crestLead);
       crestNow = mix(vCrest, crestF, nearAmt);${detailCount > 0 ? `
       // The wavelets, where a pixel can hold one. The same sum the vertex
       // stage displaced by, evaluated at the same datum footprint — but carried
@@ -856,7 +858,28 @@ ${features.hullTransmission ? `
     float combPixel = fwidth(combP.x);
     float lines = smoothstep(0.54, 0.78, fbm(combP));
     float dashes = smoothstep(0.38, 0.72, noise(vec2(across * 0.11, downwind * 0.085 - uTime * 0.05)));
-    float comb = mix(lines * dashes, 0.12, smoothstep(0.3, 0.9, combPixel));${features.foamField ? `
+    float comb = mix(lines * dashes, 0.12, smoothstep(0.3, 0.9, combPixel));
+${normalRange > 0 ? `
+    // The spill: a greybeard going over. A crest pinched past the point where
+    // this sea breaks does not just whiten at its top; it throws its white
+    // water forward and the water tumbles down the face in front of it, and
+    // that is what reads as a wave *breaking* rather than a wave that happens
+    // to be white. The face it is tumbling onto is the water that crest will
+    // reach in the next second or so (crestLead, see SPILL_LEAD), on the
+    // leading side — the same face the fold shade picks out. Drawn as fast,
+    // ragged lines running down the slope with the break. Nothing moves:
+    // throwing a real lip would put water where heightAt says there is none,
+    // in exactly the place a hull is (REVIEW.md R11), so this is the white
+    // water and the fold shade together, and the geometry stays honest.
+    float spillBand = max(uFoamHi - uFoamLo, 1e-4);
+    float spill = nearAmt
+                * smoothstep(uFoamLo, uFoamLo + 0.6 * spillBand, crestLead)
+                * clamp(dot(vNormal.xz, uWindDir) * 3.0, 0.0, 1.0);
+    if (spill > 0.002) {
+      float tumble = fbm(vec2(across * 0.85 + rag * 2.0, downwind * 0.2 - uTime * 1.4));
+      crestFoam = max(crestFoam, spill * (0.45 + 0.55 * smoothstep(0.3, 0.62, tumble)));
+    }
+` : ''}${features.foamField ? `
 
     // What this piece of sea remembers. Sampled at the datum footprint, which
     // is where the field's own pass evaluated the crest sum, so the scar and the

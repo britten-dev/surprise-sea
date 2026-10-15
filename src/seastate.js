@@ -300,6 +300,20 @@ export const FOAM_LAGS = [
   { lag: 5.0, weight: 0.3 },
 ];
 
+/**
+ * How far ahead the spill looks, in seconds. A crest that is breaking throws
+ * its white water down the face in front of it, and the water it will reach in
+ * the next moment is the water it is tumbling onto. Two looks, near and far,
+ * so the white runs on from the crest down the face rather than landing as a
+ * separate band: on the dominant swell of a storm, about twenty metres of
+ * face. The far look counts for a little less, so the white thins as it runs
+ * down. Shading only — nothing moves for it.
+ */
+export const SPILL_LEAD = [
+  { lead: 0.4, weight: 1.0 },
+  { lead: 0.9, weight: 0.85 },
+];
+
 /** GLSL has no integer/float coercion: 5 must be written 5.0 or it will not compile. */
 const glslFloat = (v) => (Number.isInteger(v) ? v.toFixed(1) : String(v));
 
@@ -474,13 +488,29 @@ export function oceanNormalChunk(waveCount = 12) {
  */
 export function oceanCrestChunk() {
   const { lagDecl, lagSums, lagFold } = crestLagChunks();
+  // θ(t + τ) = θ(t) − ω·τ: the lead is the lag run the other way.
+  const leadDecl = SPILL_LEAD.map((_, i) => `    float lead${i} = 0.0;`).join('\n');
+  const leadSums = SPILL_LEAD.map(
+    ({ lead }, i) =>
+      `      lead${i} += qka * sin(theta - uWaveOmega[i] * ${glslFloat(lead)});  // ${glslFloat(lead)} s ahead`
+  ).join('\n');
+  const leadFold = SPILL_LEAD.reduce(
+    (acc, { weight }, i) =>
+      i === 0 ? `lead0 * ${glslFloat(weight)}` : `max(${acc}, lead${i} * ${glslFloat(weight)})`,
+    ''
+  );
   return /* glsl */ `
   // gerstnerNormal and the crest in one pass over the table: the attenuation
   // and the phase are the expensive part of either, and they are the same
   // numbers. The normal is the sum gerstnerNormal returns, term for term.
-  vec3 gerstnerNormalCrest(vec2 p, float camDist, float t, out float crestOut) {
+  //
+  // leadOut is the crest pinch this point is about to have (SPILL_LEAD): high
+  // on the face just ahead of a breaking crest, which is the water that crest
+  // is about to tumble down. See the spill in ocean.js.
+  vec3 gerstnerNormalCrest(vec2 p, float camDist, float t, out float crestOut, out float leadOut) {
     vec3 normal = vec3(0.0, 1.0, 0.0);
     float crest = 0.0;
+${leadDecl}
 ${lagDecl}
 
     for (int i = 0; i < NW; i++) {
@@ -500,10 +530,12 @@ ${lagDecl}
       normal.y -= qka * s;
 
       crest += qka * s;
+${leadSums}
 ${lagSums}
     }
 
     crestOut = ${lagFold};
+    leadOut = ${leadFold};
     return normalize(normal);
   }
 `;

@@ -12,6 +12,7 @@ import {
   oceanNormalChunk,
   oceanCrestChunk,
   FOAM_LAGS,
+  SPILL_LEAD,
 } from '../src/seastate.js';
 
 const PRESET_NAMES = Object.keys(PRESETS);
@@ -492,7 +493,12 @@ test('the fragment crest chunk is the vertex crest, memory and all, beside the s
   // be one nobody uploads.
   assert.ok(!/\buniform\b/.test(chunk), 'the crest chunk should declare nothing');
   assert.ok(!chunk.includes('#define NW'), 'the crest chunk should not redefine the table');
-  assert.match(chunk, /vec3 gerstnerNormalCrest\(vec2 p, float camDist, float t, out float crestOut\)/);
+  assert.match(chunk, /vec3 gerstnerNormalCrest\(vec2 p, float camDist, float t, out float crestOut, out float leadOut\)/);
+  // The spill looks ahead by exactly the documented lead, and only ahead.
+  for (const { lead } of SPILL_LEAD) {
+    const l = Number.isInteger(lead) ? lead.toFixed(1) : String(lead);
+    assert.ok(chunk.includes(`theta - uWaveOmega[i] * ${l})`), `spill lead ${lead} is missing`);
+  }
   // The same attenuation as both other stages, so it describes the same sea.
   assert.match(chunk, /exp\(-camDist \/ \(uWaveLen\[i\] \* 45\.0 \+ 600\.0\)\)/);
   // Every lag the vertex stage remembers, at the same weight, or the white a
