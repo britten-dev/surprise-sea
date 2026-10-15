@@ -192,6 +192,12 @@ export const skyPanoramaChunk = /* glsl */ `
 `;
 
 export const skyGradientChunk = /* glsl */ `
+  // The weather overhead, in one vector so the sea pays one uniform row for it
+  // (its fragment stage is close to the WebGL2 minimum). x: how much of a gale
+  // the sky is in, nought to one — see the storm deck below. yz: how far the
+  // clouds have drifted, in metres, for whoever moves them. w: spare.
+  uniform vec4 uSkyWeather;
+
   float skyHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
   float skyNoise(vec2 p) {
     vec2 i = floor(p), f = fract(p);
@@ -209,25 +215,53 @@ export const skyGradientChunk = /* glsl */ `
     return n;
   }
   vec3 skyGradient(vec3 dir, vec3 haze, vec3 top, vec3 sunDir, vec3 sunColour, float glare) {
+    // The storm deck. A sea in a full gale under the sky of a grey afternoon
+    // reads as weather that has not arrived yet: in the Roaring Forties the
+    // cloud comes down, closes over and goes dark, and ragged scud races along
+    // beneath it. So the same ceiling, lowered (its features grow overhead and
+    // crowd the horizon), closed (the cover threshold falls until there are no
+    // gaps left), darkened underneath, and with a broken layer of scud below
+    // it. Nought is the sky exactly as it was.
+    float storm = clamp(uSkyWeather.x, 0.0, 1.0);
+
     float t = smoothstep(-0.16, 0.55, dir.y);
     float t2 = smoothstep(-0.02, 0.16, dir.y);
-    vec3 col = mix(haze, top, t * 0.72 + t2 * 0.28);
+    vec3 col = mix(haze, top * (1.0 - 0.3 * storm), t * 0.72 + t2 * 0.28);
 
     // A broad, gentle glow rather than a disc — calmer, and it never glares.
     float s = max(0.0, dot(dir, sunDir));
-    col += sunColour * pow(s, 16.0) * 0.16 * glare;
-    col += sunColour * pow(s, 220.0) * 0.40 * glare;
+    float sunThrough = 1.0 - 0.7 * storm;
+    col += sunColour * pow(s, 16.0) * 0.16 * glare * sunThrough;
+    col += sunColour * pow(s, 220.0) * 0.40 * glare * sunThrough;
     // A distant cloud ceiling. The same function lights the reflection cube, the
     // visible sky and the ocean's fallback reflection; no unrelated sky photograph.
     if (dir.y > 0.015) {
-      vec2 p = dir.xz / (dir.y + 0.18) * 1.7 + vec2(4.2, 8.1);
+      // Cloud drift is in metres on a deck about fifteen hundred metres up.
+      vec2 p = dir.xz / (dir.y + 0.18) * mix(1.7, 1.2, storm) + vec2(4.2, 8.1)
+             - uSkyWeather.yz * (1.7 / 1500.0);
       float cloud = skyCloud(p);
-      float cover = smoothstep(0.34, 0.63, cloud);
+      float cover = smoothstep(mix(0.34, 0.16, storm), mix(0.63, 0.5, storm), cloud);
       float edge = skyCloud(p + normalize(sunDir.xz + vec2(0.001)) * 0.10);
       float rim = clamp((cloud - edge) * 9.0, 0.0, 1.0);
       vec3 shade = mix(haze * 0.48, haze * 1.16 + sunColour * 0.14 * glare,
         clamp(0.28 + rim * 0.7 + s * 0.25, 0.0, 1.0));
+      // Thick cloud is dark underneath, and a storm deck is all thick cloud:
+      // the darkest where the cloud is densest, so it is mottled, not painted.
+      shade *= 1.0 - storm * (0.28 + 0.22 * smoothstep(0.45, 0.8, cloud));
       col = mix(col, shade, cover * smoothstep(0.015, 0.12, dir.y));
+
+      if (storm > 0.01) {
+        // Scud: torn fragments of low cloud a few hundred metres up, under the
+        // deck and darker than it, close enough that perspective drags them
+        // into long shreds toward the horizon. They move three times as fast
+        // across the sky as the deck above them, because they are nearer.
+        vec2 q = dir.xz / (dir.y + 0.07) * 2.4 + vec2(17.3, 3.1)
+               - uSkyWeather.yz * (2.4 / 450.0);
+        vec2 qw = vec2(skyNoise(q * 0.6), skyNoise(q * 0.6 + 23.1)) - 0.5;
+        float scud = skyCloud(q + qw * 0.9);
+        float ragged = smoothstep(0.55, 0.74, scud) * smoothstep(0.02, 0.09, dir.y);
+        col = mix(col, haze * mix(0.62, 0.42, storm), ragged * storm * 0.85);
+      }
     }
     return col;
   }
@@ -1202,6 +1236,9 @@ export function createOcean(waveField, options = {}) {
     uGlare: { value: 0.3 },
     uSunset: { value: 0 },
     uMoon: { value: 0 },
+    // Shared with the sky dome by `useSkyWeather`, so the reflected fallback
+    // sky is the same weather as the one overhead.
+    uSkyWeather: { value: new THREE.Vector4() },
     uFogDensity: { value: baseFog },
     uHeightScale: { value: 1 },
     uFoamLo: { value: 0.33 },
@@ -1390,6 +1427,7 @@ export function createOcean(waveField, options = {}) {
     uniforms.uGlare.value = lighting.glare ?? 0.4;
     uniforms.uSunset.value = lighting.sunset ? 1 : 0;
     uniforms.uMoon.value = Math.max(0, Math.min(1, lighting.moon ?? 0));
+    uniforms.uSkyWeather.value.x = Math.max(0, Math.min(1, lighting.storm ?? 0));
     uniforms.uSkyPhotoConfig.value.w = Math.max(0, Math.min(1, lighting.skyRain ?? 0));
     uniforms.uFogDensity.value = baseFog * (lighting.fogDensity ?? 1);
     uniforms.uExposure.value = lighting.exposure ?? 1;
@@ -1454,6 +1492,20 @@ export function createOcean(waveField, options = {}) {
       uniforms.uToneMap.value = on ? 1 : 0;
     },
     get toneMapped() { return uniforms.uToneMap.value > 0.5; },
+
+    /**
+     * Share the sky dome's weather: pass `sky.uniforms.uSkyWeather`. The sea
+     * draws part of its reflection from the same sky formula as the dome, and
+     * with the very same uniform object the two cannot disagree about how
+     * stormy it is or where the clouds have drifted to. Optional: alone, the
+     * sea takes its storm from `lighting.storm` and its clouds hold still.
+     */
+    useSkyWeather(uniform) {
+      if (!uniform?.value?.isVector4) return;
+      uniform.value.x = uniforms.uSkyWeather.value.x;
+      uniforms.uSkyWeather = uniform;
+      mesh.material.uniforms.uSkyWeather = uniform;
+    },
 
     setPanorama(texture, options) {
       const hadPhoto = uniforms.uSkyPhotoAmount.value > 0;

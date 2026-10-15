@@ -127,8 +127,9 @@ ${graded ? `
  *
  * @param options
  *   `lighting`        the same object `createOcean` takes; `sunDir`,
- *                     `sunColour`, `skyTop`, `skyHaze`, `glare`, `sunset`, `moon` and `exposure`
- *                     are the keys read. Partial objects are welcome — what is
+ *                     `sunColour`, `skyTop`, `skyHaze`, `glare`, `sunset`, `moon`,
+ *                     `storm` (0 a grey day, 1 the Roaring Forties at their worst)
+ *                     and `exposure` are the keys read. Partial objects are welcome — what is
  *                     left out keeps the value it had.
  *   `reflectionSize`  face size of the cube; 128 by default, 0 to do without
  *                     one entirely.
@@ -151,6 +152,9 @@ export function createSky(options = {}) {
     uMoon: { value: 0 },
     uExposure: { value: 1 },
     uToneMap: { value: 1 },
+    // x: storm, yz: cloud drift in metres. See skyGradientChunk. Hand this
+    // object to `ocean.useSkyWeather` so the sea reflects the same weather.
+    uSkyWeather: { value: new THREE.Vector4() },
   };
 
   const size = options.reflectionSize ?? REFLECTION_SIZE;
@@ -234,6 +238,7 @@ export function createSky(options = {}) {
     uniforms.uSunset.value = light.sunset ? 1 : 0;
     uniforms.uMoon.value = Math.max(0, Math.min(1, light.moon ?? 0));
     uniforms.uSkyPhotoConfig.value.w = Math.max(0, Math.min(1, light.skyRain ?? 0));
+    uniforms.uSkyWeather.value.x = Math.max(0, Math.min(1, light.storm ?? 0));
     uniforms.uExposure.value = light.exposure ?? 1;
 
     // The sky the sea reflects is now a lie. It stays one until someone with a
