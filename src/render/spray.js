@@ -17,11 +17,20 @@
 //
 // All three read the CPU sum and nothing else: `crestAt` decides where water is
 // being torn off, `orbitalVelocityAt` gives it the velocity the water already
-// had, and `roughHeightAt` is the surface it rides over and dies into. The
-// identity is preserved by construction — this file never invents water, it
-// only follows water the SeaState already describes. Height comes from
-// `roughHeightAt` rather than `heightAt` for exactly the reason CONTRACT.md
-// gives: spray is decorative, and it is never asked to touch the sea exactly.
+// had, and the surface it rides over and dies into is tracked under each
+// particle (see `trackSurface`). The identity is preserved by construction —
+// this file never invents water, it only follows water the SeaState already
+// describes.
+//
+// It used to take that surface from `roughHeightAt`, on the reasoning in
+// CONTRACT.md that spray is decorative and never asked to touch the sea
+// exactly. That is true of a millimetre and false of a storm: the un-inverted
+// sum is the height of whichever water *started* under the particle, and on a
+// pinched storm crest that water has moved metres sideways — measured, half a
+// metre wrong on average and five at worst. Spray born on a crest a few metres
+// from where the crest is drawn, and riding a sea five metres from the one on
+// screen, reads as ghosts hanging in the air. So a crest's spray is now born
+// where the crest actually is, and rides the water actually under it.
 //
 // Two things are generalised out of the game's version. The spawn threshold is
 // expressed in standard deviations of the sea's *own* crest pinch instead of
@@ -207,6 +216,55 @@ function deckPoint(rand, cx, cz, windUnit, reach, spread, near, out = _spawn) {
   return out;
 }
 
+const _surface = new THREE.Vector3();
+
+/**
+ * The height of the water under a particle, tracked rather than solved.
+ *
+ * `heightAt` inverts the Gerstner displacement with three Newton steps for
+ * every query, which is what a hull deserves and two milliseconds a frame for
+ * a sky full of spray. But a particle's water hardly moves between frames, so
+ * each one remembers the datum point it was last over, and every frame takes a
+ * single fixed-point step from there: the displacement of that point says where
+ * its water has gone, and the difference is where the datum point for *this*
+ * position must be. One pass over the table, the cost of `roughHeightAt` and a
+ * cosine. The height returned is a frame behind the step, which on water
+ * moving half a metre a frame is a few centimetres — and the remembered point
+ * converges on the true one inside a few frames of any birth, because the
+ * Gerstner pinch is capped well below the one at which the step would diverge.
+ *
+ * @param ux, uz  the particles' remembered datum points, updated in place.
+ */
+export function trackSurface(sea, ux, uz, i, x, z, t) {
+  const px = ux[i];
+  const pz = uz[i];
+  let dx = 0;
+  let dz = 0;
+  let h = 0;
+  for (const w of sea.waves) {
+    const theta = w.k * (w.dx * px + w.dz * pz) - w.omega * t + w.phase;
+    const c = w.q * w.amp * Math.cos(theta);
+    dx += w.dx * c;
+    dz += w.dz * c;
+    h += w.amp * Math.sin(theta);
+  }
+  ux[i] = x - dx;
+  uz[i] = z - dz;
+  return h;
+}
+
+/**
+ * Born on a breaking crest: the crest test is asked at a datum point, because
+ * that is where the pinch is summed, and the water that is pinching there is
+ * drawn at the *displaced* point. Places the particle's water there, remembers
+ * the datum point for `trackSurface`, and returns the displaced point.
+ */
+function bornOnCrest(sea, ux, uz, i, x, z, t) {
+  ux[i] = x;
+  uz[i] = z;
+  return sea.displacedPointAt(x, z, t, _surface);
+}
+
 /** Direction the wind blows *toward*, as a unit vector on the xz plane. */
 function downwind(windFromDeg, out = new THREE.Vector2()) {
   const rad = THREE.MathUtils.degToRad(windFromDeg);
@@ -378,23 +436,29 @@ const sheetVert = /* glsl */ `
   varying float vAge;
 
   void main() {
-    vec4 mv = modelViewMatrix * vec4(iPos, 1.0);
+    // Drawn out along the wind in the world, not on the screen. Laid along the
+    // wind as the screen sees it, a veil seen from a camera looking downwind —
+    // which is the chase camera on a ship running before a gale, which is the
+    // game — had its long axis pointing at the horizon and stood up off the
+    // water as a pillar of smoke forty metres tall. Here the long axis is the
+    // wind itself, and the short one turns about it to face the eye: from the
+    // beam a veil is a curtain hanging off the crest, from astern it is a
+    // streak lying down the face of the sea, and neither is a column.
+    vec3 centre = (modelMatrix * vec4(iPos, 1.0)).xyz;
+    vec3 along = vec3(uWindDir.x, 0.0, uWindDir.y);
+    vec3 side = cross(along, normalize(cameraPosition - centre));
+    float sl = length(side);
+    // Dead on the axis there is no face to turn; hang it upright.
+    side = sl > 1e-3 ? side / sl : vec3(0.0, 1.0, 0.0);
 
-    vec3 windView = (viewMatrix * vec4(uWindDir.x, 0.0, uWindDir.y, 0.0)).xyz;
-    // Dead on the axis the wind vanishes from the screen; hold the last sane
-    // orientation rather than normalising a zero.
-    float wl = length(windView.xy);
-    vec2 axis = wl > 1e-3 ? windView.xy / wl : vec2(1.0, 0.0);
-    vec2 perp = vec2(-axis.y, axis.x);
-
-    mv.xy += axis * position.x * iSize.x + perp * position.y * iSize.y;
+    vec3 world = centre + along * position.x * iSize.x + side * position.y * iSize.y;
 
     vUv = position.xy + 0.5;
     vFade = iFade;
     vSeed = iSeed;
     vAge = iAge;
 
-    gl_Position = projectionMatrix * mv;
+    gl_Position = projectionMatrix * viewMatrix * vec4(world, 1.0);
   }
 `;
 
@@ -468,6 +532,9 @@ function createSpume(count, seed) {
   const sizes = new Float32Array(count);
   const life = new Float32Array(count);
   const maxLife = new Float32Array(count);
+  // The datum point each particle's water was last over. See trackSurface.
+  const ux = new Float32Array(count);
+  const uz = new Float32Array(count);
   const rand = makeRandom(seed);
   const maxSearch = Math.max(1, Math.ceil(count * SEARCH_SHARE));
   let cursor = 0;
@@ -551,9 +618,10 @@ function createSpume(count, seed) {
               : spawnPoint(rand, c.cx, c.cz, range, c.windUnit, 1.2, 4, travel * 0.5);
           if (sea.crestAt(x, z, t) < profile.spumeThreshold) continue;
 
-          positions[o] = x;
-          positions[o + 1] = sea.roughHeightAt(x, z, t) + (0.3 + rand() * 1.3) * scale;
-          positions[o + 2] = z;
+          const at = bornOnCrest(sea, ux, uz, i, x, z, t);
+          positions[o] = at.x;
+          positions[o + 1] = at.y + (0.3 + rand() * 1.3) * scale;
+          positions[o + 2] = at.z;
           maxLife[i] = 1.6 + rand() * 2.2;
           life[i] = maxLife[i];
           sizes[i] = (0.4 + rand() * 0.9) * scale;
@@ -567,7 +635,7 @@ function createSpume(count, seed) {
 
       positions[o] += wind.x * 1.15 * dt;
       positions[o + 2] += wind.z * 1.15 * dt;
-      const surface = sea.roughHeightAt(positions[o], positions[o + 2], t);
+      const surface = trackSurface(sea, ux, uz, i, positions[o], positions[o + 2], t);
       // The game's metre of clearance, plus the streak's own size — which is
       // already in the sea's units, so it must not be scaled twice. Spume that
       // rides three metres up stops reading as foam being dragged over water
@@ -608,6 +676,9 @@ function createDroplets(count, seed) {
   const sizes = new Float32Array(count);
   const life = new Float32Array(count);
   const maxLife = new Float32Array(count);
+  // The datum point each particle's water was last over. See trackSurface.
+  const ux = new Float32Array(count);
+  const uz = new Float32Array(count);
   const rand = makeRandom(seed);
   const birth = new THREE.Vector3();
   const maxSearch = Math.max(1, Math.ceil(count * SEARCH_SHARE));
@@ -693,12 +764,15 @@ function createDroplets(count, seed) {
           // and a hard break is one or two.
           const over = (pinch - profile.dropletThreshold) / profile.crestSigma;
 
-          sea.orbitalVelocityAt(x, z, t, birth);
+          const at = bornOnCrest(sea, ux, uz, i, x, z, t);
+          positions[o] = at.x;
+          positions[o + 1] = at.y + (0.3 + rand() * 0.9) * scale;
+          positions[o + 2] = at.z;
+          // Asked at the drawn crest, which `orbitalVelocityAt` inverts back to
+          // the datum point the pinch was summed at: the water's own velocity.
+          sea.orbitalVelocityAt(at.x, at.z, t, birth);
           const kick = profile.kickRef * (0.22 + 0.26 * over) * (0.6 + rand() * 0.9);
 
-          positions[o] = x;
-          positions[o + 1] = sea.roughHeightAt(x, z, t) + (0.3 + rand() * 0.9) * scale;
-          positions[o + 2] = z;
           velocities[o] = birth.x + wind.x * 1.15;
           velocities[o + 1] = birth.y + kick;
           velocities[o + 2] = birth.z + wind.z * 1.15;
@@ -745,8 +819,8 @@ function createDroplets(count, seed) {
       // Back into the sea. Given a moment first, so a droplet born a hand's
       // breadth above a crest is not killed by the crest it came off.
       const age = maxLife[i] - life[i];
-      if (age > 0.15 &&
-          positions[o + 1] < sea.roughHeightAt(positions[o], positions[o + 2], t)) {
+      const below = trackSurface(sea, ux, uz, i, positions[o], positions[o + 2], t);
+      if (age > 0.15 && positions[o + 1] < below) {
         life[i] = 0;
         fades[i] = 0;
         alive--;
@@ -785,6 +859,9 @@ function createSheets(count, seed) {
   const ages = new Float32Array(count);
   const life = new Float32Array(count);
   const maxLife = new Float32Array(count);
+  // The datum point each particle's water was last over. See trackSurface.
+  const ux = new Float32Array(count);
+  const uz = new Float32Array(count);
   const rand = makeRandom(seed);
   const maxSearch = Math.max(1, Math.ceil(count * SEARCH_SHARE));
   let cursor = 0;
@@ -865,16 +942,20 @@ function createSheets(count, seed) {
           const { x, z } = spawnPoint(rand, c.cx, c.cz, range, c.windUnit, 0.9, 50, travel * 0.5);
           if (sea.crestAt(x, z, t) < profile.sheetThreshold) continue;
 
-          positions[o] = x;
-          positions[o + 1] = sea.roughHeightAt(x, z, t) + (1.5 + rand() * 4.5) * scale;
-          positions[o + 2] = z;
+          const at = bornOnCrest(sea, ux, uz, i, x, z, t);
+          positions[o] = at.x;
+          // Low, and lifting only a little: a veil is torn off the top of a
+          // crest and streams away close over the next one. Born six metres up
+          // and rising, with eighteen of height, it was a cloud.
+          positions[o + 1] = at.y + (0.4 + rand() * 2.0) * scale;
+          positions[o + 2] = at.z;
           // Faster than the wind at birth: the crest flings it away.
           velocities[o] = wind.x * 1.3;
-          velocities[o + 1] = 0.4 + rand() * 0.8;
+          velocities[o + 1] = 0.2 + rand() * 0.5;
           velocities[o + 2] = wind.z * 1.3;
 
-          sizes[i * 2] = (24 + rand() * 46) * scale;
-          sizes[i * 2 + 1] = (7 + rand() * 11) * scale;
+          sizes[i * 2] = (20 + rand() * 30) * scale;
+          sizes[i * 2 + 1] = (3 + rand() * 5) * scale;
           seeds[i] = rand();
           maxLife[i] = 3.0 + rand() * 4.0;
           life[i] = maxLife[i];
@@ -902,7 +983,7 @@ function createSheets(count, seed) {
       ages[i] = lifeT;
 
       // Into the back of the next sea, which is where a veil ends.
-      if (positions[o + 1] < sea.roughHeightAt(positions[o], positions[o + 2], t)) {
+      if (positions[o + 1] < trackSurface(sea, ux, uz, i, positions[o], positions[o + 2], t)) {
         life[i] = 0;
         fades[i] = 0;
         alive--;

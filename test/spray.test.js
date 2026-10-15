@@ -12,7 +12,7 @@ import { Vector3 } from 'three';
 
 import { createSeaState } from '../src/spectrum.js';
 import { WaveField } from '../src/wavefield.js';
-import { createSpray, sprayProfile } from '../src/render/spray.js';
+import { createSpray, sprayProfile, trackSurface } from '../src/render/spray.js';
 
 /** Small pools: these tests are about the arithmetic, not the budget. */
 const POOL = { spume: 120, droplets: 80, sheets: 8 };
@@ -401,4 +401,30 @@ test('an albatross at altitude is never rained on by its own spray', () => {
     spray.update(1 / 60, eye);
   }
   assert.equal(hits, 0, 'a bird two hundred metres up was hit in the face');
+});
+
+test('spray tracks the sea that is drawn, not the water that started under it', () => {
+  // The un-inverted height is metres out on a storm crest; spray held to it
+  // hangs in the air over the trough or rides inside the face. A particle
+  // carried downwind across a storm sea, tracked one step a frame, should stay
+  // within a few centimetres of the authoritative surface the whole way.
+  const sea = createSeaState({ preset: 'storm', seed: 1805 });
+  const ux = new Float32Array(1);
+  const uz = new Float32Array(1);
+  ux[0] = 10;
+  uz[0] = 20;
+  const born = sea.displacedPointAt(10, 20, 37);
+  let x = born.x;
+  let rough = 0;
+  let worst = 0;
+  for (let f = 0; f < 600; f++) {
+    const t = 37 + f / 60;
+    x += 30 / 60;
+    const h = trackSurface(sea, ux, uz, 0, x, born.z, t);
+    const truth = sea.heightAt(x, born.z, t);
+    rough = Math.max(rough, Math.abs(sea.roughHeightAt(x, born.z, t) - truth));
+    if (f > 5) worst = Math.max(worst, Math.abs(h - truth));
+  }
+  assert.ok(rough > 1, `the path should cross water where the rough height is wrong (${rough.toFixed(2)})`);
+  assert.ok(worst < 0.2, `tracking strayed ${worst.toFixed(2)} m from the drawn surface`);
 });
