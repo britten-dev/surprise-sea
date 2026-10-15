@@ -582,6 +582,12 @@ ${detailCount > 0 ? `  // The same octave folded about its own middle, which tur
 ${features.hullMask ? '    bool hullInterior = insideHull(vWorldPos);' : ''}
     vec3 viewDir = normalize(uCameraPos - vWorldPos);
     float dist = distance(uCameraPos, vWorldPos);
+    // Metres of sea under one pixel, the worse of the two screen directions —
+    // which at a grazing angle is the long one. Taken here, where every
+    // fragment is still in step, for the layers below that must not draw
+    // detail a pixel cannot hold.
+    vec2 pxv = fwidth(vUndisp);
+    float px = max(pxv.x, pxv.y);
     vec3 sun = normalize(uSunDir);
 
     // --- Surface definition -------------------------------------------------
@@ -605,13 +611,13 @@ ${normalRange > 0 ? `
       // Horizontal range, to match the attenuation the vertex stage applied.
       float camDistF = distance(vUndisp, uCameraPos.xz);
       float crestF;
-      vec3 nf = gerstnerNormalCrest(vUndisp, camDistF, uTime, crestF, crestLead);
+      vec3 nf = gerstnerNormalCrest(vUndisp, camDistF, uTime, px, crestF, crestLead);
       crestNow = mix(vCrest, crestF, nearAmt);${detailCount > 0 ? `
       // The wavelets, where a pixel can hold one. The same sum the vertex
       // stage displaced by, evaluated at the same datum footprint — but carried
       // an order of magnitude further out, because a pixel resolves half a
       // metre of chop at twenty metres and a vertex resolves it nowhere.
-      nf = normalize(nf + detailSlope(vUndisp, camDistF, uTime) * uDetail);` : ''}
+      nf = normalize(nf + detailSlope(vUndisp, camDistF, uTime, px) * uDetail);` : ''}
       n = normalize(mix(vNormal, nf, nearAmt));
     }
 ` : ''}${features.cascade ? `
@@ -650,7 +656,10 @@ ${features.cascade ? `    // And down again wherever the cascade is running. The
     // of invention on the near water falls as this layer lands, which is the
     // trade R9 asked for by name.
     rippleAmt *= 1.0 - 0.75 * cascAmt;
-` : ''}    if (rippleAmt > 0.01) {
+` : ''}    // And the noise is metres across, so it goes the same way as the wavelets
+    // when a pixel grows to the size of its features.
+    rippleAmt *= 1.0 - smoothstep(0.7, 1.5, px);
+    if (rippleAmt > 0.01) {
       vec2 rp = vUndisp * 0.31 + uWindDir * uTime * -1.4;
       float e = 0.9;
       float gx = fbm(rp + vec2(e, 0.0)) - fbm(rp - vec2(e, 0.0));

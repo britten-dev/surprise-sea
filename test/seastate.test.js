@@ -493,7 +493,7 @@ test('the fragment crest chunk is the vertex crest, memory and all, beside the s
   // be one nobody uploads.
   assert.ok(!/\buniform\b/.test(chunk), 'the crest chunk should declare nothing');
   assert.ok(!chunk.includes('#define NW'), 'the crest chunk should not redefine the table');
-  assert.match(chunk, /vec3 gerstnerNormalCrest\(vec2 p, float camDist, float t, out float crestOut, out float leadOut\)/);
+  assert.match(chunk, /vec3 gerstnerNormalCrest\(vec2 p, float camDist, float t, float px, out float crestOut, out float leadOut\)/);
   // The spill looks ahead by exactly the documented lead, and only ahead.
   for (const { lead } of SPILL_LEAD) {
     const l = Number.isInteger(lead) ? lead.toFixed(1) : String(lead);

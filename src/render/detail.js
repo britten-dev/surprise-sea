@@ -347,14 +347,19 @@ export function detailNormalChunk(count = DETAIL_COUNT) {
   return /* glsl */ `
   ${detailDeclarations(count)}
 
-  vec3 detailSlope(vec2 p, float camDist, float t) {
+  // px: metres of sea per pixel. As in gerstnerNormalCrest, a wavelet shorter
+  // than a couple of pixels is only aliasing, so it fades out between four
+  // pixels and two — which matters most on a screen drawn at reduced
+  // resolution, where the distance fade above was tuned for a full one.
+  vec3 detailSlope(vec2 p, float camDist, float t, float px) {
     vec3 slope = vec3(0.0);
 
     float fade = detailFade(camDist);
     if (fade < 0.004) return slope;
 
     for (int i = 0; i < ND; i++) {
-      float amp = uDetAmp[i] * fade * exp(-camDist / (uDetLen[i] * 34.0 + 8.0));
+      float amp = uDetAmp[i] * fade * exp(-camDist / (uDetLen[i] * 34.0 + 8.0))
+                * (1.0 - smoothstep(0.25, 0.5, px / uDetLen[i]));
       if (amp < 0.0004) continue;
 
       vec2 dir = uDetDir[i];

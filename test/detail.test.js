@@ -254,7 +254,7 @@ test('the whole treatment answers to one dial', () => {
   // Wavelets, lace and fold shadow all pass through uDetail, so nought is the
   // sea exactly as it was before any of them and the eye can be asked to
   // compare the two rather than to remember.
-  assert.ok(/detailSlope\(vUndisp, camDistF, uTime\) \* uDetail/.test(f));
+  assert.ok(/detailSlope\(vUndisp, camDistF, uTime, px\) \* uDetail/.test(f));
   assert.ok(/float laceAmt = .*\* uDetail;/.test(f));
   assert.ok(/\* uDetail;\s*\n\s*water = mix\(water, uDeep/.test(f));
 
