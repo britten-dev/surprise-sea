@@ -507,7 +507,15 @@ export function oceanCrestChunk() {
   // leadOut is the crest pinch this point is about to have (SPILL_LEAD): high
   // on the face just ahead of a breaking crest, which is the water that crest
   // is about to tumble down. See the spill in ocean.js.
-  vec3 gerstnerNormalCrest(vec2 p, float camDist, float t, out float crestOut, out float leadOut) {
+  //
+  // px is how many metres of sea one pixel covers here. A wave shorter than a
+  // couple of pixels cannot be drawn, only aliased: its normal flips facet to
+  // facet between neighbouring pixels and the sky it reflects breaks into a
+  // speckle that, on a screen drawn at reduced resolution and scaled up, reads
+  // as a field of little bricks. So each wave's share of the normal fades out
+  // as it shrinks from four pixels to two. Its share of the crest does not:
+  // that is a coverage, cut softly, and the foam needs the pinch it adds.
+  vec3 gerstnerNormalCrest(vec2 p, float camDist, float t, float px, out float crestOut, out float leadOut) {
     vec3 normal = vec3(0.0, 1.0, 0.0);
     float crest = 0.0;
 ${leadDecl}
@@ -524,10 +532,11 @@ ${lagDecl}
       float c = cos(theta);
       float ka = uWaveK[i] * amp;
       float qka = uWaveQ[i] * ka;
+      float drawn = 1.0 - smoothstep(0.25, 0.5, px / uWaveLen[i]);
 
-      normal.x -= d.x * ka * c;
-      normal.z -= d.y * ka * c;
-      normal.y -= qka * s;
+      normal.x -= d.x * ka * c * drawn;
+      normal.z -= d.y * ka * c * drawn;
+      normal.y -= qka * s * drawn;
 
       crest += qka * s;
 ${leadSums}
