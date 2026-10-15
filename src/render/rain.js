@@ -71,7 +71,13 @@ const MAX_SHEAR = 25;
  * being a squall a mile off — which is the whole thing being drawn — and
  * becomes a grey sheet across the lens.
  */
-const CURTAIN = { near: 900, far: 3400, spawnNear: 1900, spawnFar: 3200 };
+const CURTAIN = {
+  near: 900, far: 3400, spawnNear: 1900, spawnFar: 3200,
+  // How far off the eye's line a squall is born, and the spread beyond that:
+  // it passes on the beam at about this range, which keeps it well outside
+  // the near fade, then goes on downwind into the distance ahead.
+  abeam: 700, abeamSpread: 1300,
+};
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
@@ -227,6 +233,8 @@ const curtainVert = /* glsl */ `
   attribute float iFade;
   attribute float iSeed;
 
+  uniform vec3 uLean;      // downwind, scaled by how far the top runs ahead of the foot
+
   varying vec2 vUv;
   varying float vFade;
   varying float vSeed;
@@ -245,6 +253,10 @@ const curtainVert = /* glsl */ `
     // The quad's foot sits at iPos, on the water, and it hangs upward from
     // there — so a curtain always meets the sea and never floats above it.
     mv.xyz += right * position.x * iSize.x + upView * (position.y + 0.5) * iSize.y;
+    // Rain shafts slant. The drops are falling through a wind that is
+    // stronger aloft, so the top of a squall runs on ahead of its foot, and a
+    // row of leaning grey shafts is how a squall line looks from a deck.
+    mv.xyz += (viewMatrix * vec4(uLean, 0.0)).xyz * (position.y + 0.5) * iSize.y;
 
     vUv = position.xy + vec2(0.5);
     vFade = iFade;
@@ -277,22 +289,28 @@ const curtainFrag = /* glsl */ `
   }
 
   void main() {
-    // Soft at both sides, or a curtain reads as a poster of a curtain.
-    float across = smoothstep(0.0, 0.26, vUv.x) * smoothstep(1.0, 0.74, vUv.x);
+    // Soft at both sides, or a curtain reads as a poster of a curtain — and
+    // ragged, the edge wandering with height, because a straight soft edge on
+    // a quad still reads as a quad from a mile off.
+    float wander = fbm(vec2(vUv.y * 3.1 + vSeed * 7.3, vSeed * 3.7 + uTime * 0.02)) - 0.5;
+    float across = smoothstep(0.0, 0.34, vUv.x + wander * 0.2)
+                 * smoothstep(1.0, 0.66, vUv.x - wander * 0.2);
 
     // Rooted at the water and thinning upward. The contact with the sea is the
     // whole sight — a squall is a thing you watch *arrive* across the water —
     // so the density is greatest low down, with the first few metres feathered
-    // into spray, and it never quite goes out at the top because there is no
-    // cloud drawn up there for it to disappear into.
-    float hang = smoothstep(0.0, 0.08, vUv.y)
-               * (0.35 + 0.65 * smoothstep(1.0, 0.15, vUv.y));
+    // into spray. At the top it goes up into the storm deck, which is dark
+    // cloud of much its own colour, so it fades out there rather than ending
+    // on a flat line across the sky.
+    float hang = smoothstep(0.0, 0.06, vUv.y)
+               * (0.5 + 0.5 * smoothstep(0.95, 0.3, vUv.y))
+               * smoothstep(1.0, 0.78, vUv.y);
 
     // Rain falls in columns. They are drawn out vertically, they differ from
     // curtain to curtain, and they crawl, so a squall is never a still shape.
     float col = fbm(vec2(vUv.x * 7.5 + vSeed * 41.0,
                          vUv.y * 1.7 - vSeed * 13.0 - uTime * 0.06));
-    float veil = mix(0.4, 1.0, smoothstep(0.28, 0.76, col));
+    float veil = mix(0.35, 1.0, smoothstep(0.3, 0.74, col));
 
     float alpha = across * hang * veil * vFade * uOpacity;
     if (alpha < 0.003) discard;
@@ -496,6 +514,7 @@ function createCurtains(count, seed) {
     uColour: { value: new THREE.Color(0x9aa2a4) },
     uOpacity: { value: 0 },
     uTime: { value: 0 },
+    uLean: { value: new THREE.Vector3() },
   };
 
   const mesh = new THREE.Mesh(
@@ -522,26 +541,33 @@ function createCurtains(count, seed) {
    */
   function place(i, cx, cz, upwindAng) {
     const o = i * 3;
-    const ang =
-      upwindAng === null
-        ? rand() * TAU
-        // A wedge either side of dead upwind, so they arrive from where the
-        // weather is coming from without marching in single file.
-        : upwindAng + (rand() - 0.5) * 2.4;
-    const range =
-      upwindAng === null
-        ? CURTAIN.near + rand() * (CURTAIN.far - CURTAIN.near)
-        : CURTAIN.spawnNear + rand() * (CURTAIN.spawnFar - CURTAIN.spawnNear);
-
-    positions[o] = cx + Math.sin(ang) * range;
+    if (upwindAng === null) {
+      const ang = rand() * TAU;
+      const range = CURTAIN.near + rand() * (CURTAIN.far - CURTAIN.near);
+      positions[o] = cx + Math.sin(ang) * range;
+      positions[o + 2] = cz + Math.cos(ang) * range;
+    } else {
+      // Upwind, where the weather comes from — and off to one side of the
+      // eye's line, so it passes on the beam and then goes on downwind ahead
+      // of her toward the horizon rather than marching straight at the lens
+      // and being faded out before it can be seen going away. Born dead
+      // upwind, a squall only ever existed behind a ship running before it.
+      const up = CURTAIN.spawnNear + rand() * (CURTAIN.spawnFar - CURTAIN.spawnNear);
+      const side = (rand() < 0.5 ? -1 : 1) * (CURTAIN.abeam + rand() * CURTAIN.abeamSpread);
+      const ux = Math.sin(upwindAng);
+      const uz = Math.cos(upwindAng);
+      positions[o] = cx + ux * up + uz * side;
+      positions[o + 2] = cz + uz * up - ux * side;
+    }
     // Mean sea level. A curtain is hundreds of metres across and a point sample
     // of the surface under one corner of it would be an arbitrary number; the
     // soft foot in the fragment stage does the rest.
     positions[o + 1] = 0;
-    positions[o + 2] = cz + Math.cos(ang) * range;
 
-    sizes[i * 2] = 260 + rand() * 320;      // half-width
-    sizes[i * 2 + 1] = 170 + rand() * 220;  // height
+    // Taller and narrower than they were: a squall is shafts hanging from a
+    // cloud base, and at 170 m tall and 580 m wide it was a fog bank.
+    sizes[i * 2] = 200 + rand() * 260;      // half-width
+    sizes[i * 2 + 1] = 240 + rand() * 260;  // height
     seeds[i] = rand();
     fades[i] = 0;
   }
@@ -572,6 +598,9 @@ function createCurtains(count, seed) {
       const rz = positions[o + 2] - cz;
       const range = Math.sqrt(rx * rx + rz * rz);
 
+      // Gone over the horizon downwind (or, by some turn of the ship, come
+      // right on top of her, where it is already faded to nothing): start
+      // another one upwind.
       if (range > CURTAIN.far || range < CURTAIN.near * 0.55) {
         place(i, cx, cz, upwindAng);
         continue;
@@ -683,7 +712,10 @@ export function createRain(waveField, options = {}) {
 
     // A curtain is a shadow as much as it is water: the haze colour, taken
     // down, so it reads as a thickening of the air rather than a white sheet.
-    curtains.uniforms.uColour.value.copy(hazeCol).multiplyScalar(0.86);
+    // Well down. At 0.86 of the haze it stood in front of a horizon the colour
+    // of the haze and simply vanished into it; a squall a mile off is the
+    // darkest thing on the horizon, grey shafts against a paler sky behind.
+    curtains.uniforms.uColour.value.copy(hazeCol).multiplyScalar(0.45);
   }
 
   function setLighting(next = {}) {
@@ -721,7 +753,7 @@ export function createRain(waveField, options = {}) {
     // squall's worth of drops straight in.
     const onset = smoothstep(0, 0.14, rain);
     streaks.uniforms.uOpacity.value = 0.5 * onset;
-    curtains.uniforms.uOpacity.value = 0.42 * onset * (0.45 + 0.55 * rain);
+    curtains.uniforms.uOpacity.value = 0.85 * onset * (0.45 + 0.55 * rain);
   }
 
   function setSeaState() {
@@ -771,6 +803,10 @@ export function createRain(waveField, options = {}) {
       streaks.uniforms.uLength.value = Math.max(speed * 0.032, 0.28);
 
       curtains.uniforms.uTime.value = t;
+      // The slant: a third of the height downwind in a full gale, upright in
+      // a calm.
+      const lean = Math.min((sea?.windSpeed ?? 0) / 75, 0.4);
+      curtains.uniforms.uLean.value.set(windUnit.x * lean, 0, windUnit.z * lean);
 
       const cx = cameraPos?.x ?? 0;
       const cy = cameraPos?.y ?? 0;

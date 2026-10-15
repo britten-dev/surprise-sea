@@ -320,3 +320,15 @@ test('dispose empties the group', () => {
   rain.dispose();
   assert.equal(rain.object3d.children.length, 0);
 });
+
+test('squall shafts lean downwind with the wind, and stand up in a calm', () => {
+  const gale = rig('storm');
+  gale.rain.setWeather({ rain: 0.8 });
+  run(gale.field, gale.rain, 30);
+  const lean = gale.rain.uniforms.curtains.uLean.value;
+  assert.ok(lean.length() > 0.2 && lean.length() <= 0.4 + 1e-9, `a gale leaned the shafts ${lean.length().toFixed(2)}`);
+  const calm = rig('calm');
+  calm.rain.setWeather({ rain: 0.8 });
+  run(calm.field, calm.rain, 30);
+  assert.ok(calm.rain.uniforms.curtains.uLean.value.length() < 0.1, 'a calm leaned the shafts over');
+});
