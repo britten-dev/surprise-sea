@@ -9,8 +9,10 @@ Helmsman's Watch, and The Pursuit. Two halves, one law:
 
 Everything is deterministic: same options → same sea, every run. No
 `Date.now`, no `Math.random` in simulation code — seeded LCGs only. Plain
-JavaScript ES modules, three.js ^0.180 as the only dependency. Comment in the
-voice of the reference code: explain *why*, literately, not what.
+JavaScript ES modules, three.js (0.180 or later) as the only dependency — a
+peer dependency, so a game that moves to a newer three keeps one copy of it and
+its `instanceof` checks still hold. Comment in the voice of the reference code:
+explain *why*, literately, not what.
 
 Reference implementations to read before writing anything (working code from
 the albatross game — port, generalise, improve; do not import from there):
@@ -94,8 +96,9 @@ Queries (all take explicit `t` seconds):
 - `roughHeightAt(x, z, t)` — vertical terms only, no inversion. For things
   far from the eye, or that only need a ballpark (an altitude). It is the
   height of the water that *started* at (x,z), which on a storm crest is
-  metres from the water drawn there — up to ~5 m in `storm`. Spray near the
-  eye tracks the true surface instead (`render/spray.js`, `trackSurface`).
+  metres from the water drawn there — up to ~5 m in `storm`. Spray and rain
+  near the eye track the true surface instead (`render/spray.js`,
+  `trackSurface`).
 - `gradientAt(x, z, t, spread = 22)` — finite differences of `heightAt`.
 - `normalAt(x, z, t, spread, out?)` — from the gradient, THREE.Vector3.
 - `crestAt(x, z, t)` — Σ q·k·A·sin(θ): how pinched the surface is; foam and

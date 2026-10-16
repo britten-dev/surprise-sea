@@ -19,18 +19,23 @@
 // no draw call, no instances. That matters because rain is the one layer in the
 // library that is off most of the time.
 //
-// The rain does not touch the sea. It never moves a vertex, never feeds the
-// wave table, and never asks `heightAt` for the authoritative surface — drops
-// die against `roughHeightAt`, which is what CONTRACT.md prescribes for
-// anything decorative. What the rain *does* couple to, the demo does in one
-// place and passes through `setLighting`: thicker fog and greyer colours. That
-// coupling is arithmetic on a lighting object, not something hidden in here.
+// The rain does not touch the sea. It never moves a vertex and never feeds the
+// wave table; it only reads where the water is, so a drop can die on it. That
+// used to be `roughHeightAt`, which CONTRACT.md allows anything decorative, but
+// on a storm crest the un-inverted sum is metres from the water drawn there,
+// and rain is the one thing in the library that falls on the sea right in
+// front of the eye. So each drop tracks the true surface under it the way the
+// spray does (`trackSurface`). What the rain *does* couple to, the demo does
+// in one place and passes through `setLighting`: thicker fog and greyer
+// colours. That coupling is arithmetic on a lighting object, not something
+// hidden in here.
 //
 // Frame history, and so exempt from strict determinism by the amendment — but
 // the seeded LCG is here anyway, because a bounded, repeatable pool is easier
 // to test than a random one and costs nothing to keep.
 
 import * as THREE from 'three';
+import { trackSurface } from './spray.js';
 
 /**
  * How much of this a machine gets. Streaks are the pool size, not the live
@@ -113,6 +118,9 @@ function readColour(out, value) {
   else out.set(value);
   return out;
 }
+
+/** Scratch for the one exact solve a drop gets when it arrives. */
+const _datum = { x: 0, z: 0 };
 
 /**
  * Fold a coordinate back into a span centred on the camera, however far outside
@@ -357,6 +365,9 @@ function createStreaks(count, seed) {
   const positions = new Float32Array(count * 3);
   const fades = new Float32Array(count);
   const lengths = new Float32Array(count);
+  // The datum point each drop's water was last over. See trackSurface.
+  const ux = new Float32Array(count);
+  const uz = new Float32Array(count);
   const rand = makeRandom(seed);
   let placed = false;
 
@@ -391,6 +402,19 @@ function createStreaks(count, seed) {
   mesh.renderOrder = 30;
   mesh.name = 'rain-streaks';
 
+  /**
+   * Solve, once and exactly, which water is under a drop that has just
+   * arrived over it. From here `trackSurface` follows it a step a frame; only
+   * a drop that is new, or has come round through a wall, needs the solve.
+   * Returns the height of that water, which is `heightAt` without paying twice.
+   */
+  function seat(i, x, z, sea, t) {
+    const datum = sea.undisplacedAt(x, z, t, _datum);
+    ux[i] = datum.x;
+    uz[i] = datum.z;
+    return sea.roughHeightAt(datum.x, datum.z, t);
+  }
+
   /** Put one drop somewhere in the box, at a height that is over the water. */
   function place(i, cx, cy, cz, sea, t, top) {
     const o = i * 3;
@@ -398,6 +422,7 @@ function createStreaks(count, seed) {
     const z = cz + (rand() * 2 - 1) * VOLUME.halfWidth;
     positions[o] = x;
     positions[o + 2] = z;
+    const water = seat(i, x, z, sea, t);
     // Almost always the lid of the box. In a survival sea the eye can be deep
     // in a trough with a crest standing over it, and a drop born under the
     // water would only be killed again next frame — so it is lifted clear of
@@ -405,7 +430,7 @@ function createStreaks(count, seed) {
     // recycles at, so the two can never argue.
     positions[o + 1] = top
       ? Math.min(
-          Math.max(cy + VOLUME.halfHeight, sea.roughHeightAt(x, z, t) + 3),
+          Math.max(cy + VOLUME.halfHeight, water + 3),
           cy + VOLUME.halfHeight * 1.5
         )
       : cy - VOLUME.halfHeight + rand() * VOLUME.halfHeight * 2;
@@ -432,25 +457,30 @@ function createStreaks(count, seed) {
     for (let i = 0; i < live; i++) {
       const o = i * 3;
 
-      positions[o] += vx;
+      const ox = positions[o] + vx;
+      const oz = positions[o + 2] + vz;
       positions[o + 1] += vy;
-      positions[o + 2] += vz;
 
       // Sideways the box is a torus: a drop blown out of one wall is the same
       // drop as one blowing in through the other, and rain has no identity.
-      positions[o] = wrap(positions[o], cx, VOLUME.halfWidth);
-      positions[o + 2] = wrap(positions[o + 2], cz, VOLUME.halfWidth);
+      positions[o] = wrap(ox, cx, VOLUME.halfWidth);
+      positions[o + 2] = wrap(oz, cz, VOLUME.halfWidth);
 
       const x = positions[o];
       const y = positions[o + 1];
       const z = positions[o + 2];
+
+      // The water a drop was over is no guide to the water forty metres away.
+      if (Math.abs(ox - cx) >= VOLUME.halfWidth || Math.abs(oz - cz) >= VOLUME.halfWidth) {
+        seat(i, x, z, sea, t);
+      }
 
       // Three ways out of the pool, and all of them come back through the lid:
       // into the water, out of the floor, or — after the eye has been picked up
       // and put down somewhere else, or a slot has sat idle while the rain was
       // lighter — stranded far above it. Nothing here can loop, because the lid
       // itself is held under this same ceiling.
-      const surface = sea.roughHeightAt(x, z, t);
+      const surface = trackSurface(sea, ux, uz, i, x, z, t);
       if (y < surface ||
           y < cy - VOLUME.halfHeight ||
           y > cy + VOLUME.halfHeight * 1.6) {
