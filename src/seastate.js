@@ -266,16 +266,21 @@ export class SeaState {
   }
 }
 
-/** Uniform values for the shaders, in the layout `oceanVertexChunk` expects. */
+/**
+ * Uniform values for the shaders, in the layout `oceanVertexChunk` expects:
+ * two vec4s a wave, as flat arrays.
+ *
+ *   uWaveA[i] = (dx, dz, k, omega)
+ *   uWaveB[i] = (amp, q, length, phase)
+ *
+ * Every term of a wave is read together, so packed it is two uniform loads a
+ * wave rather than seven, and the sea draws a few per cent cheaper for it. The
+ * numbers are the table's, untouched; only where they sit has moved.
+ */
 export function waveUniforms(seaState) {
   return {
-    uWaveDir: { value: seaState.waves.flatMap((w) => [w.dx, w.dz]) },
-    uWaveK: { value: seaState.waves.map((w) => w.k) },
-    uWaveOmega: { value: seaState.waves.map((w) => w.omega) },
-    uWaveAmp: { value: seaState.waves.map((w) => w.amp) },
-    uWaveQ: { value: seaState.waves.map((w) => w.q) },
-    uWaveLen: { value: seaState.waves.map((w) => w.length) },
-    uWavePhase: { value: seaState.waves.map((w) => w.phase) },
+    uWaveA: { value: seaState.waves.flatMap((w) => [w.dx, w.dz, w.k, w.omega]) },
+    uWaveB: { value: seaState.waves.flatMap((w) => [w.amp, w.q, w.length, w.phase]) },
   };
 }
 
@@ -326,13 +331,9 @@ function waveArrayDeclarations(waveCount) {
   return /* glsl */ `
   #define NW ${waveCount}
 
-  uniform vec2 uWaveDir[NW];
-  uniform float uWaveK[NW];
-  uniform float uWaveOmega[NW];
-  uniform float uWaveAmp[NW];
-  uniform float uWaveQ[NW];
-  uniform float uWaveLen[NW];
-  uniform float uWavePhase[NW];
+  // Two vec4s a wave. See waveUniforms.
+  uniform vec4 uWaveA[NW];  // dx, dz, k, omega
+  uniform vec4 uWaveB[NW];  // amp, q, length, phase
 `;
 }
 
@@ -361,7 +362,7 @@ function crestLagChunks() {
   // one extra sine per wave, not another pass over the table.
   const lagSums = FOAM_LAGS.map(
     ({ lag }, i) =>
-      `      crestLag${i} += qka * sin(theta + uWaveOmega[i] * ${glslFloat(lag)});  // ${glslFloat(lag)} s ago`
+      `      crestLag${i} += qka * sin(theta + uWaveA[i].w * ${glslFloat(lag)});  // ${glslFloat(lag)} s ago`
   ).join('\n');
 
   // Nested, because GLSL's max takes two arguments however many lags there are.
@@ -390,17 +391,17 @@ export function oceanVertexChunk(waveCount = 12) {
 ${lagDecl}
 
     for (int i = 0; i < NW; i++) {
-      float att = exp(-camDist / (uWaveLen[i] * 45.0 + 600.0));
-      float amp = uWaveAmp[i] * att;
+      float att = exp(-camDist / (uWaveB[i].z * 45.0 + 600.0));
+      float amp = uWaveB[i].x * att;
       if (amp < 0.001) continue;
 
-      vec2 d = uWaveDir[i];
-      float theta = uWaveK[i] * dot(d, p) - uWaveOmega[i] * uTime + uWavePhase[i];
+      vec2 d = uWaveA[i].xy;
+      float theta = uWaveA[i].z * dot(d, p) - uWaveA[i].w * uTime + uWaveB[i].w;
       float s = sin(theta);
       float c = cos(theta);
-      float qa = uWaveQ[i] * amp;
-      float ka = uWaveK[i] * amp;
-      float qka = uWaveQ[i] * ka;
+      float qa = uWaveB[i].y * amp;
+      float ka = uWaveA[i].z * amp;
+      float qka = uWaveB[i].y * ka;
 
       pos.x += d.x * qa * c;
       pos.z += d.y * qa * c;
@@ -451,17 +452,17 @@ export function oceanNormalChunk(waveCount = 12) {
     vec3 normal = vec3(0.0, 1.0, 0.0);
 
     for (int i = 0; i < NW; i++) {
-      float att = exp(-camDist / (uWaveLen[i] * 45.0 + 600.0));
-      float amp = uWaveAmp[i] * att;
+      float att = exp(-camDist / (uWaveB[i].z * 45.0 + 600.0));
+      float amp = uWaveB[i].x * att;
       if (amp < 0.001) continue;
 
-      vec2 d = uWaveDir[i];
-      float theta = uWaveK[i] * dot(d, p) - uWaveOmega[i] * t + uWavePhase[i];
-      float ka = uWaveK[i] * amp;
+      vec2 d = uWaveA[i].xy;
+      float theta = uWaveA[i].z * dot(d, p) - uWaveA[i].w * t + uWaveB[i].w;
+      float ka = uWaveA[i].z * amp;
 
       normal.x -= d.x * ka * cos(theta);
       normal.z -= d.y * ka * cos(theta);
-      normal.y -= uWaveQ[i] * ka * sin(theta);
+      normal.y -= uWaveB[i].y * ka * sin(theta);
     }
 
     return normalize(normal);
@@ -492,7 +493,7 @@ export function oceanCrestChunk() {
   const leadDecl = SPILL_LEAD.map((_, i) => `    float lead${i} = 0.0;`).join('\n');
   const leadSums = SPILL_LEAD.map(
     ({ lead }, i) =>
-      `      lead${i} += qka * sin(theta - uWaveOmega[i] * ${glslFloat(lead)});  // ${glslFloat(lead)} s ahead`
+      `      lead${i} += qka * sin(theta - uWaveA[i].w * ${glslFloat(lead)});  // ${glslFloat(lead)} s ahead`
   ).join('\n');
   const leadFold = SPILL_LEAD.reduce(
     (acc, { weight }, i) =>
@@ -522,17 +523,17 @@ ${leadDecl}
 ${lagDecl}
 
     for (int i = 0; i < NW; i++) {
-      float att = exp(-camDist / (uWaveLen[i] * 45.0 + 600.0));
-      float amp = uWaveAmp[i] * att;
+      float att = exp(-camDist / (uWaveB[i].z * 45.0 + 600.0));
+      float amp = uWaveB[i].x * att;
       if (amp < 0.001) continue;
 
-      vec2 d = uWaveDir[i];
-      float theta = uWaveK[i] * dot(d, p) - uWaveOmega[i] * t + uWavePhase[i];
+      vec2 d = uWaveA[i].xy;
+      float theta = uWaveA[i].z * dot(d, p) - uWaveA[i].w * t + uWaveB[i].w;
       float s = sin(theta);
       float c = cos(theta);
-      float ka = uWaveK[i] * amp;
-      float qka = uWaveQ[i] * ka;
-      float drawn = 1.0 - smoothstep(0.25, 0.5, px / uWaveLen[i]);
+      float ka = uWaveA[i].z * amp;
+      float qka = uWaveB[i].y * ka;
+      float drawn = 1.0 - smoothstep(0.25, 0.5, px / uWaveB[i].z);
 
       normal.x -= d.x * ka * c * drawn;
       normal.z -= d.y * ka * c * drawn;

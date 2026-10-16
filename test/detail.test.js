@@ -16,6 +16,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createSeaState, PRESETS } from '../src/spectrum.js';
+import { waveUniforms } from '../src/seastate.js';
 import { WaveField } from '../src/wavefield.js';
 import { createOcean } from '../src/render/ocean.js';
 import {
@@ -110,7 +111,7 @@ test('the physics never sees any of it', () => {
   // nothing walking the physical table can reach the visual one by accident.
   const detailKeys = Object.keys(detailUniforms(ocean.detail));
   for (const key of detailKeys) {
-    assert.ok(!(key in { uWaveDir: 1, uWaveK: 1, uWaveOmega: 1, uWaveAmp: 1, uWaveQ: 1 }), key);
+    assert.ok(!(key in waveUniforms(sea)), key);
   }
 });
 
@@ -275,16 +276,12 @@ test('the uniforms are the table, and a change of sea re-uploads them', () => {
   const material = ocean.mesh.material;
   const table = ocean.detail;
 
-  assert.deepEqual(ocean.uniforms.uDetAmp.value, table.waves.map((w) => w.amp));
-  assert.deepEqual(ocean.uniforms.uDetLen.value, table.waves.map((w) => w.length));
-  assert.deepEqual(
-    ocean.uniforms.uDetDir.value,
-    table.waves.flatMap((w) => [w.dx, w.dz])
-  );
+  assert.deepEqual(ocean.uniforms.uDetA.value, table.waves.flatMap((w) => [w.dx, w.dz, w.k, w.omega]));
+  assert.deepEqual(ocean.uniforms.uDetB.value, table.waves.flatMap((w) => [w.amp, w.q, w.length, w.phase]));
 
   ocean.setSeaState(createSeaState({ preset: 'calm' }));
   assert.ok(ocean.detail.ampSum < table.ampSum, 'a calm sea kept the storm chop');
-  assert.deepEqual(ocean.uniforms.uDetAmp.value, ocean.detail.waves.map((w) => w.amp));
+  assert.deepEqual(ocean.uniforms.uDetB.value, ocean.detail.waves.flatMap((w) => [w.amp, w.q, w.length, w.phase]));
 
   // The count never changes, so this is a re-upload and never a recompile.
   assert.equal(ocean.mesh.material, material, 'a change of sea rebuilt the material');

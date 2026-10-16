@@ -280,13 +280,16 @@ test('crest pinch peaks where the surface is sharpest', () => {
 test('the uniform arrays carry the whole table, in the shader layout', () => {
   const sea = createSeaState({ preset: 'storm', waveCount: 9 });
   const u = waveUniforms(sea);
-  assert.equal(u.uWaveDir.value.length, 18);
-  for (const key of ['uWaveK', 'uWaveOmega', 'uWaveAmp', 'uWaveQ', 'uWaveLen', 'uWavePhase']) {
-    assert.equal(u[key].value.length, 9, key);
+  // Two vec4s a wave and nothing else: A = (dx, dz, k, omega), B = (amp, q, length, phase).
+  assert.deepEqual(Object.keys(u), ['uWaveA', 'uWaveB']);
+  for (const key of ['uWaveA', 'uWaveB']) {
+    assert.equal(u[key].value.length, 36, key);
     for (const v of u[key].value) assert.ok(Number.isFinite(v), key);
   }
-  assert.equal(u.uWaveDir.value[0], sea.waves[0].dx);
-  assert.equal(u.uWaveDir.value[1], sea.waves[0].dz);
+  sea.waves.forEach((w, i) => {
+    assert.deepEqual(u.uWaveA.value.slice(i * 4, i * 4 + 4), [w.dx, w.dz, w.k, w.omega], `wave ${i} A`);
+    assert.deepEqual(u.uWaveB.value.slice(i * 4, i * 4 + 4), [w.amp, w.q, w.length, w.phase], `wave ${i} B`);
+  });
 });
 
 test('the GLSL chunk is generated for the table it will be given', () => {
@@ -295,8 +298,8 @@ test('the GLSL chunk is generated for the table it will be given', () => {
   assert.match(chunk, /vec3 gerstner\(vec2 p, float camDist, out vec3 normal, out float crest\)/);
   // The distance attenuation is the one thing in the shader the CPU does not
   // do, and it is load-bearing: without it the horizon aliases.
-  assert.match(chunk, /exp\(-camDist \/ \(uWaveLen\[i\] \* 45\.0 \+ 600\.0\)\)/);
-  for (const name of ['uWaveDir', 'uWaveK', 'uWaveOmega', 'uWaveAmp', 'uWaveQ', 'uWaveLen', 'uWavePhase', 'uTime']) {
+  assert.match(chunk, /exp\(-camDist \/ \(uWaveB\[i\]\.z \* 45\.0 \+ 600\.0\)\)/);
+  for (const name of ['uWaveA', 'uWaveB', 'uTime']) {
     assert.ok(chunk.includes(name), `chunk is missing uniform ${name}`);
   }
 });
@@ -318,7 +321,7 @@ test('the crest sum is evaluated at every foam lag, and folded in as a max', () 
       `no accumulator for the ${lag}s lag`
     );
     assert.ok(
-      chunk.includes(`sin(theta + uWaveOmega[i] * ${asGlslFloat(lag)})`),
+      chunk.includes(`sin(theta + uWaveA[i].w * ${asGlslFloat(lag)})`),
       `the ${lag}s lagged crest sum is missing`
     );
     assert.ok(
@@ -408,7 +411,7 @@ test('the fragment normal chunk is the same sum, minus the displacement', () => 
   assert.match(chunk, /vec3 gerstnerNormal\(vec2 p, float camDist, float t\)/);
   // The same attenuation as the vertex stage, or the per-pixel normal would
   // describe a different sea from the one the mesh is standing in.
-  assert.match(chunk, /exp\(-camDist \/ \(uWaveLen\[i\] \* 45\.0 \+ 600\.0\)\)/);
+  assert.match(chunk, /exp\(-camDist \/ \(uWaveB\[i\]\.z \* 45\.0 \+ 600\.0\)\)/);
   // Waves the distance has already faded to nothing cost nothing.
   assert.match(chunk, /if \(amp < 0\.001\) continue;/);
   // It is a normal and only a normal: no position, no crest, no foam memory.
@@ -455,12 +458,10 @@ test('the shader sum, walked by hand, reproduces displacedPointAt', () => {
     let py = 0;
     let pz = z;
     for (let i = 0; i < sea.waves.length; i++) {
-      const dx = u.uWaveDir.value[i * 2];
-      const dz = u.uWaveDir.value[i * 2 + 1];
-      const amp = u.uWaveAmp.value[i];
-      const theta =
-        u.uWaveK.value[i] * (dx * x + dz * z) - u.uWaveOmega.value[i] * t + u.uWavePhase.value[i];
-      const qa = u.uWaveQ.value[i] * amp;
+      const [dx, dz, k, omega] = u.uWaveA.value.slice(i * 4, i * 4 + 4);
+      const [amp, q, , phase] = u.uWaveB.value.slice(i * 4, i * 4 + 4);
+      const theta = k * (dx * x + dz * z) - omega * t + phase;
+      const qa = q * amp;
       px += dx * qa * Math.cos(theta);
       pz += dz * qa * Math.cos(theta);
       py += amp * Math.sin(theta);
@@ -497,16 +498,16 @@ test('the fragment crest chunk is the vertex crest, memory and all, beside the s
   // The spill looks ahead by exactly the documented lead, and only ahead.
   for (const { lead } of SPILL_LEAD) {
     const l = Number.isInteger(lead) ? lead.toFixed(1) : String(lead);
-    assert.ok(chunk.includes(`theta - uWaveOmega[i] * ${l})`), `spill lead ${lead} is missing`);
+    assert.ok(chunk.includes(`theta - uWaveA[i].w * ${l})`), `spill lead ${lead} is missing`);
   }
   // The same attenuation as both other stages, so it describes the same sea.
-  assert.match(chunk, /exp\(-camDist \/ \(uWaveLen\[i\] \* 45\.0 \+ 600\.0\)\)/);
+  assert.match(chunk, /exp\(-camDist \/ \(uWaveB\[i\]\.z \* 45\.0 \+ 600\.0\)\)/);
   // Every lag the vertex stage remembers, at the same weight, or the white a
   // pixel shows would not be the white the foam field and the CPU agree on.
   for (const { lag, weight } of FOAM_LAGS) {
     const l = Number.isInteger(lag) ? lag.toFixed(1) : String(lag);
     const w = Number.isInteger(weight) ? weight.toFixed(1) : String(weight);
-    assert.ok(chunk.includes(`uWaveOmega[i] * ${l})`), `lag ${lag} is missing`);
+    assert.ok(chunk.includes(`uWaveA[i].w * ${l})`), `lag ${lag} is missing`);
     assert.ok(chunk.includes(`* ${w})`), `weight ${weight} is missing`);
   }
   // And no position: it is shading only.

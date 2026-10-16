@@ -245,13 +245,8 @@ export function detailTable(sea, count = DETAIL_COUNT) {
  *  table must ever be able to reach this one by accident. */
 export function detailUniforms(table) {
   return {
-    uDetDir: { value: table.waves.flatMap((w) => [w.dx, w.dz]) },
-    uDetK: { value: table.waves.map((w) => w.k) },
-    uDetOmega: { value: table.waves.map((w) => w.omega) },
-    uDetAmp: { value: table.waves.map((w) => w.amp) },
-    uDetQ: { value: table.waves.map((w) => w.q) },
-    uDetLen: { value: table.waves.map((w) => w.length) },
-    uDetPhase: { value: table.waves.map((w) => w.phase) },
+    uDetA: { value: table.waves.flatMap((w) => [w.dx, w.dz, w.k, w.omega]) },
+    uDetB: { value: table.waves.flatMap((w) => [w.amp, w.q, w.length, w.phase]) },
   };
 }
 
@@ -265,13 +260,9 @@ function detailDeclarations(count) {
   return /* glsl */ `
   #define ND ${count}
 
-  uniform vec2 uDetDir[ND];
-  uniform float uDetK[ND];
-  uniform float uDetOmega[ND];
-  uniform float uDetAmp[ND];
-  uniform float uDetQ[ND];
-  uniform float uDetLen[ND];
-  uniform float uDetPhase[ND];
+  // Two vec4s a wavelet, laid out as the physical table's are.
+  uniform vec4 uDetA[ND];  // dx, dz, k, omega
+  uniform vec4 uDetB[ND];  // amp, q, length, phase
 
   // The near field, and only the near field. Beyond the far range there is no
   // pixel that could resolve half a metre of chop and no vertex that could
@@ -309,15 +300,15 @@ export function detailVertexChunk(count = DETAIL_COUNT) {
     if (fade < 0.004) return d;
 
     for (int i = 0; i < ND; i++) {
-      float amp = uDetAmp[i] * fade * exp(-camDist / (uDetLen[i] * 2.5 + 1.0));
+      float amp = uDetB[i].x * fade * exp(-camDist / (uDetB[i].z * 2.5 + 1.0));
       if (amp < 0.0004) continue;
 
-      vec2 dir = uDetDir[i];
-      float theta = uDetK[i] * dot(dir, p) - uDetOmega[i] * t + uDetPhase[i];
+      vec2 dir = uDetA[i].xy;
+      float theta = uDetA[i].z * dot(dir, p) - uDetA[i].w * t + uDetB[i].w;
       float s = sin(theta);
       float c = cos(theta);
-      float qa = uDetQ[i] * amp;
-      float ka = uDetK[i] * amp;
+      float qa = uDetB[i].y * amp;
+      float ka = uDetA[i].z * amp;
 
       d.x += dir.x * qa * c;
       d.z += dir.y * qa * c;
@@ -325,7 +316,7 @@ export function detailVertexChunk(count = DETAIL_COUNT) {
 
       slope.x -= dir.x * ka * c;
       slope.z -= dir.y * ka * c;
-      slope.y -= uDetQ[i] * ka * s;
+      slope.y -= uDetB[i].y * ka * s;
     }
 
     return d;
@@ -358,17 +349,17 @@ export function detailNormalChunk(count = DETAIL_COUNT) {
     if (fade < 0.004) return slope;
 
     for (int i = 0; i < ND; i++) {
-      float amp = uDetAmp[i] * fade * exp(-camDist / (uDetLen[i] * 34.0 + 8.0))
-                * (1.0 - smoothstep(0.25, 0.5, px / uDetLen[i]));
+      float amp = uDetB[i].x * fade * exp(-camDist / (uDetB[i].z * 34.0 + 8.0))
+                * (1.0 - smoothstep(0.25, 0.5, px / uDetB[i].z));
       if (amp < 0.0004) continue;
 
-      vec2 dir = uDetDir[i];
-      float theta = uDetK[i] * dot(dir, p) - uDetOmega[i] * t + uDetPhase[i];
-      float ka = uDetK[i] * amp;
+      vec2 dir = uDetA[i].xy;
+      float theta = uDetA[i].z * dot(dir, p) - uDetA[i].w * t + uDetB[i].w;
+      float ka = uDetA[i].z * amp;
 
       slope.x -= dir.x * ka * cos(theta);
       slope.z -= dir.y * ka * cos(theta);
-      slope.y -= uDetQ[i] * ka * sin(theta);
+      slope.y -= uDetB[i].y * ka * sin(theta);
     }
 
     return slope;
