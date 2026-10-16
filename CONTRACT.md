@@ -109,7 +109,10 @@ Queries (all take explicit `t` seconds):
 
 GPU twin:
 
-- `waveUniforms(seaState)` — uniform arrays uWaveDir/K/Omega/Amp/Q/Len/Phase.
+- `waveUniforms(seaState)` — two flat uniform arrays, two vec4s a wave:
+  uWaveA[i] = (dx, dz, k, ω) and uWaveB[i] = (amp, q, length, phase). The
+  wavelets (`render/detail.js`, `detailUniforms`) use the same layout as
+  uDetA/uDetB. Layout only: the numbers are the table's, unchanged.
 - `oceanVertexChunk(waveCount)` — the GLSL `gerstner(p, camDist, out normal,
   out crest)` function, generated for NW = waveCount, with per-wave distance
   attenuation `exp(-camDist / (L·45 + 600))` so coarse far mesh never aliases.
