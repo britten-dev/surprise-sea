@@ -275,6 +275,35 @@ test('a zero or negative step is ignored rather than dividing by it', () => {
   assert.ok(Number.isFinite(r.hull.roll));
 });
 
+test('an infinite step is ignored too', () => {
+  const r = rig('storm');
+  sail(r, 5, { rudder: 0.4, thrust: 1 });
+  const before = { ...r.hull.position };
+  r.hull.update(Infinity, r.field, { rudder: 1, thrust: 1 });
+  r.hull.update(NaN, r.field, { rudder: 1, thrust: 1 });
+  assert.deepEqual({ ...r.hull.position }, before);
+});
+
+test('one frame of NaN helm or thrust does not poison her, and she carries on', () => {
+  for (const bad of [{ rudder: NaN }, { thrust: NaN }, { rudder: Infinity, thrust: -Infinity }]) {
+    const r = rig('storm');
+    sail(r, 5, { rudder: 0.4, thrust: 1 });
+    r.field.advance(DT);
+    r.hull.update(DT, r.field, { rudder: 0.4, thrust: 1, ...bad });
+    const at = { ...r.hull.position };
+    sail(r, 5, { rudder: 0.4, thrust: 1 });
+
+    const label = JSON.stringify(bad, (k, v) => (typeof v === 'number' ? String(v) : v));
+    const numbers = [
+      r.hull.position.x, r.hull.position.y, r.hull.position.z,
+      r.hull.speed, r.hull.headingRad, r.hull.yawRate, r.hull.roll, r.hull.pitch,
+    ];
+    for (const v of numbers) assert.ok(Number.isFinite(v), `${label}: non-finite ${v}`);
+    const moved = Math.hypot(r.hull.position.x - at.x, r.hull.position.z - at.z);
+    assert.ok(moved > 5, `${label}: she only made ${moved.toFixed(1)} m in five seconds`);
+  }
+});
+
 // --- What a renderer is handed -----------------------------------------------
 
 test('the transform is a mesh you can drop straight on the water', () => {
@@ -387,6 +416,18 @@ test('the field steps once and every query in the frame sees the same sea', () =
   assert.equal(field.time, 3.5);
   assert.equal(field.heightAt(10, 20), sea.heightAt(10, 20, 3.5));
   assert.deepEqual(field.gradientAt(10, 20), sea.gradientAt(10, 20, 3.5));
+});
+
+test('a step that is not a finite, positive time leaves the clock alone', () => {
+  const field = new WaveField(createSeaState({ preset: 'storm' }));
+  field.advance(2);
+  for (const dt of [NaN, Infinity, -Infinity, -1, 0, undefined, '1']) {
+    field.advance(dt);
+    assert.equal(field.time, 2, `advance(${String(dt)}) moved the clock`);
+  }
+  assert.ok(Number.isFinite(field.heightAt(10, 20)));
+  field.advance(0.5);
+  assert.equal(field.time, 2.5);
 });
 
 test('a live sea change keeps the clock running', () => {

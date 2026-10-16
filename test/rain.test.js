@@ -230,6 +230,9 @@ test('the rain follows the eye up and down as well as along', () => {
   }
 });
 
+/** How far a tracked surface may trail the true one: a frame of water and wind. */
+const FRAME_LAG = 0.3;
+
 test('every live drop is above the water it is about to die on', () => {
   const { field, rain, sea } = rig('greybeards', { rain: 1 });
   const eye = new Vector3(0, 8, 0);
@@ -244,10 +247,44 @@ test('every live drop is above the water it is about to die on', () => {
     const y = pos[i * 3 + 1];
     const z = pos[i * 3 + 2];
     assert.ok(
-      y >= sea.roughHeightAt(x, z, t) - 1e-6,
-      `a drop is ${(sea.roughHeightAt(x, z, t) - y).toFixed(2)} m under the sea`
+      y >= sea.heightAt(x, z, t) - FRAME_LAG,
+      `a drop is ${(sea.heightAt(x, z, t) - y).toFixed(2)} m under the sea`
     );
   }
+});
+
+test('drops die on the water that is drawn, not in the air over a crest', () => {
+  // The un-inverted sum is metres from the drawn water on a greybeard crest,
+  // so a drop that died against it would stop short in mid-air. Watch every
+  // death in the open box (the walls are a wrap, not a death) and ask the
+  // exact surface how far above it the drop still was.
+  const { field, rain, sea } = rig('greybeards', { rain: 1, budget: { streaks: 240, curtains: 4 } });
+  const eye = new Vector3(0, 8, 0);
+  const streaks = layers(rain)['rain-streaks'];
+  const pos = streaks.geometry.attributes.iPos.array;
+  let before = null;
+  let deaths = 0;
+  let worst = 0;
+
+  for (let f = 0; f < 900; f++) {
+    field.advance(1 / 60);
+    eye.x += 5 / 60;
+    rain.update(1 / 60, eye);
+    if (before) {
+      for (let i = 0; i < streaks.geometry.instanceCount; i++) {
+        const [x, y, z] = [before[i * 3], before[i * 3 + 1], before[i * 3 + 2]];
+        const respawned = pos[i * 3 + 1] > y + 2;
+        const inTheOpen = Math.abs(x - eye.x) < 20 && Math.abs(z - eye.z) < 20;
+        if (!respawned || !inTheOpen || y < eye.y - 11) continue;
+        deaths++;
+        worst = Math.max(worst, y - sea.heightAt(x, z, field.time));
+      }
+    }
+    before = Float32Array.from(pos);
+  }
+
+  assert.ok(deaths > 500, `only ${deaths} drops reached the water`);
+  assert.ok(worst < 0.5, `a drop died ${worst.toFixed(2)} m above the drawn sea`);
 });
 
 test('the curtains stay in the middle distance', () => {

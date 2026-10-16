@@ -37,8 +37,10 @@ export class WaveField {
     return this;
   }
 
+  /** A step that is not a finite, positive number of seconds is ignored: one
+   *  NaN added to the clock would make every height NaN for good. */
   advance(dt) {
-    this.time += dt;
+    if (Number.isFinite(dt) && dt > 0) this.time += dt;
   }
 
   heightAt(x, z) {

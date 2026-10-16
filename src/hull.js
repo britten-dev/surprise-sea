@@ -217,12 +217,15 @@ export class Hull {
    *                Defaults to zero for hosts that only simulate waves.
    */
   update(dt, field, { rudder = 0, thrust = 0, heel = 0 } = {}) {
-    if (!(dt > 0) || !field) return this;
+    if (!(dt > 0 && dt < Infinity) || !field) return this;
 
     const o = this.options;
     const sea = field.sea;
-    const helm = clamp(rudder, -1, 1);
-    const drive = clamp(thrust, 0, 1);
+    // clamp passes NaN straight through, and one NaN in her speed or heading
+    // is in her position for ever after. A control that is not a number is
+    // the helm let go and the canvas off for that step.
+    const helm = Number.isFinite(rudder) ? clamp(rudder, -1, 1) : 0;
+    const drive = Number.isFinite(thrust) ? clamp(thrust, 0, 1) : 0;
 
     // Compass frame: forward along the heading, starboard ninety to the right.
     const fx = Math.sin(this.headingRad);
