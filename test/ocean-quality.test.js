@@ -45,3 +45,31 @@ test('the near field can be switched off and on under a running sea, and is then
  assert.throws(()=>ocean.setNormalRange(NaN),TypeError);
  for(const o of [near,far,ocean])o.dispose();
 });
+
+test('materialFor is the shader a switch would make, and makes no switch',()=>{
+ const field=new WaveField(createSeaState({preset:'storm',seed:1805}));
+ const cascade={uniforms:{}},foam={uniforms:{}};
+ const build=(normalRange,withAll)=>createOcean(field,{quality:{gridN:64,halfSpan:16000,exponent:2.2,normalRange},
+  cascade:withAll?cascade:null,foamField:withAll?foam:null});
+ const full=build(400,true),low=build(0,false),ocean=build(400,true);
+ const same=(a,b)=>{assert.equal(a.vertexShader,b.vertexShader);assert.equal(a.fragmentShader,b.fragmentShader);assert.equal(a.toneMapped,b.toneMapped);};
+ const live=ocean.mesh.material,keys=Object.keys(ocean.uniforms).sort();
+ // Down, without going there.
+ const down=ocean.materialFor({normalRange:0,foamField:null,cascade:null});
+ same(down,low.mesh.material);assert.notEqual(down,live);assert.equal(down.uniforms,ocean.uniforms);
+ assert.equal(ocean.mesh.material,live);assert.equal(ocean.normalRange,400);
+ assert.deepEqual(Object.keys(ocean.uniforms).sort(),keys);
+ // Nothing asked: the live shader.
+ same(ocean.materialFor(),live);
+ // A cascade offered with the near field compiled out is declined, as setDetailCascade declines it.
+ same(ocean.materialFor({normalRange:0,foamField:null}),low.mesh.material);
+ // And back up from a sea that really went down: the shader the switches then make.
+ ocean.setFoamField(null);ocean.setDetailCascade(null);ocean.setNormalRange(0);
+ const up=ocean.materialFor({normalRange:400,foamField:foam,cascade});
+ same(up,full.mesh.material);
+ ocean.setFoamField(foam);ocean.setDetailCascade(cascade);ocean.setNormalRange(400);
+ same(up,ocean.mesh.material);
+ assert.throws(()=>ocean.materialFor({normalRange:NaN}),TypeError);
+ for(const m of [down,up])m.dispose();
+ for(const o of [full,low,ocean])o.dispose();
+});

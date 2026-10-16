@@ -1366,15 +1366,19 @@ export function createOcean(waveField, options = {}) {
     }
   }
 
-  const makeMaterial = () =>
-    new THREE.ShaderMaterial({
-      vertexShader: vertexShader(waveCount, detailCount, hullMask !== null),
-      fragmentShader: fragmentShader(waveCount, normalRange, detailCount, {
-        foamField: foamField !== null,
+  // `range`, `withFoam` and `withCascade` are what `materialFor` asks after; the
+  // live material always takes them as they stand.
+  const makeMaterial = (range = normalRange, withFoam = foamField !== null,
+    withCascade = cascade !== null) => {
+    const details = range > 0 ? DETAIL_COUNT : 0;
+    return new THREE.ShaderMaterial({
+      vertexShader: vertexShader(waveCount, details, hullMask !== null),
+      fragmentShader: fragmentShader(waveCount, range, details, {
+        foamField: withFoam,
         wakeField: wakeField !== null,
         reflection: reflection !== null,
         panorama: uniforms.uSkyPhotoAmount.value > 0,
-        cascade: cascade !== null,
+        cascade: withCascade,
         hullMask: hullMask !== null,
         shipReflection: shipReflection !== null,
         hullTransmission: hullTransmission !== null,
@@ -1385,6 +1389,7 @@ export function createOcean(waveField, options = {}) {
       // the sea a second time.
       toneMapped: false,
     });
+  };
 
   adoptFoamField(options.foamField);
   adoptWakeField(options.wakeField);
@@ -1613,6 +1618,36 @@ export function createOcean(waveField, options = {}) {
     /** The near-field range in force, in metres; nought when it is compiled out. */
     get normalRange() {
       return normalRange;
+    },
+
+    /**
+     * The material the sea would draw with after `setNormalRange`, `setFoamField`
+     * and `setDetailCascade` were called with these, without calling them.
+     *
+     * Each of those is a new shader, and the first frame that draws one waits
+     * while it is built — a tenth of a second on a laptop. A game that knows
+     * which switches it may throw can build their shaders before it throws them
+     * (`renderer.compile` with this material on a mesh of its own), and the
+     * switch then finds them ready. Nothing here changes: the live material,
+     * the uniform map and the adopted fields are as they were. Anything left out
+     * is taken as it stands, and a cascade is declined for the same reasons
+     * `setDetailCascade` declines one.
+     *
+     * The material is the caller's, and is never meant to be drawn: it shares
+     * the live uniform map, which holds only what the live shader declares.
+     * Keep it as long as its shader is wanted. three.js deletes a program when
+     * the last material using it is disposed, and the sea disposes its own
+     * material at every switch, so this may be the only one holding it.
+     *
+     * @param changes  `normalRange` in metres, `foamField` and `cascade` as
+     *                 those setters take them (null for none).
+     */
+    materialFor({ normalRange: range = normalRange, foamField: foam = foamField,
+      cascade: offered = offeredCascade } = {}) {
+      if (!Number.isFinite(range)) throw new TypeError('normal range must be finite');
+      range = Math.max(0, range);
+      const withCascade = !!offered && !offered.disabled && range > 0;
+      return makeMaterial(range, !!foam, withCascade);
     },
 
     /**
