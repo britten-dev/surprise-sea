@@ -14,6 +14,12 @@
 // fixed (x, z) means inverting that horizontal displacement. That inversion is
 // the only fiddly thing in this file, and it is why `heightAt` costs four
 // passes over the table instead of one.
+//
+// On top of the table a sea can carry up to MAX_PACKETS wave packets: a group
+// of two or three very large seas under one travelling envelope, which grows,
+// comes on at the group speed and dies away. A rogue sea, in short. Packets are
+// added to every sum below, CPU and GPU alike, so a hull rides the rogue the
+// eye is watching.
 
 import { Vector3 } from 'three';
 
@@ -44,6 +50,101 @@ const MIN_JACOBIAN_DET = 1e-6;
 const _heightU = { x: 0, z: 0 };
 const _orbitU = { x: 0, z: 0 };
 const _pointU = { x: 0, z: 0 };
+
+/** How many packets a sea can carry at once. Compiled into the shaders as NP. */
+export const MAX_PACKETS = 2;
+
+/**
+ * The summed pinch, sea and packet together, that a packet may take a crest
+ * up to. The surface folds over at one; the spectrum stops at 0.8. A packet is
+ * allowed what is left under this, and no more, so a rogue sea sharpens the
+ * crest it rides on without ever turning it inside out.
+ */
+const PACKET_PINCH_CEILING = 0.95;
+
+const GRAVITY_PACKET = 9.81;
+
+/**
+ * A packet, described: where its envelope is centred when it is born, which
+ * way it runs, its carrier wavelength, its height at its peak, and its life.
+ *
+ *   x, z        metres: the centre of the envelope at `born`
+ *   bearingDeg  compass bearing it travels toward; default the dominant train's
+ *   length      carrier wavelength, metres; default 1.15 × the dominant
+ *   height      amplitude at the peak of its life and the centre of its envelope
+ *   pinch       Q·k·A at that peak; default, and at most, what the ceiling leaves
+ *   born, life  seconds on the sea's clock; it is nothing outside [born, born+life]
+ *   along       envelope standard deviation along its track, metres; default one
+ *               wavelength, which is two or three big crests
+ *   across      the same across its track; default two and a half wavelengths
+ *   phase       radians
+ *
+ * The envelope is centred at (x, z) + d·cg·(t − born), where cg = ω / 2k is the
+ * deep-water group speed: half the speed of its own crests, so each crest
+ * rises through the back of the group, peaks in the middle and fades out of its
+ * front, as a real group's do. Its height over its life is sin²(π·τ), τ the
+ * fraction of its life gone: nothing, a peak half way, nothing again.
+ */
+function describePacket(p, sea) {
+  const bearingDeg = p.bearingDeg ?? (Math.atan2(sea.dominant?.dx ?? 0, -(sea.dominant?.dz ?? -1)) * 180) / Math.PI;
+  const bearing = (bearingDeg * Math.PI) / 180;
+  const length = Math.max(1, p.length ?? (sea.dominantLength || 200) * 1.15);
+  const k = (2 * Math.PI) / length;
+  const omega = Math.sqrt(GRAVITY_PACKET * k);
+  const height = Math.max(0, p.height ?? 0);
+  const room = Math.max(0, PACKET_PINCH_CEILING - sea.pinch);
+  const pinch = Math.max(0, Math.min(room, p.pinch ?? room));
+  return {
+    x: p.x ?? 0,
+    z: p.z ?? 0,
+    bearingDeg,
+    dx: Math.sin(bearing),
+    dz: -Math.cos(bearing),
+    length,
+    k,
+    omega,
+    groupSpeed: omega / (2 * k),
+    phaseSpeed: omega / k,
+    height,
+    pinch,
+    q: height > 0 ? pinch / (k * height) : 0,
+    born: p.born ?? 0,
+    life: Math.max(0, p.life ?? 0),
+    along: Math.max(1, p.along ?? length),
+    across: Math.max(1, p.across ?? length * 2.5),
+    phase: p.phase ?? 0,
+  };
+}
+
+/**
+ * How big packet `p` is at (x, z) and t — its height under the envelope, or
+ * nought outside its life — with the envelope's gradient in `grad` when asked.
+ * The GLSL `packetEnvelope` is this, term for term.
+ */
+function packetEnvelope(p, x, z, t, grad = null) {
+  if (p.life <= 0 || p.height <= 0) return 0;
+  const tau = (t - p.born) / p.life;
+  if (tau <= 0 || tau >= 1) return 0;
+  const g = Math.sin(Math.PI * tau);
+  const run = p.groupSpeed * (t - p.born);
+  const rx = x - (p.x + p.dx * run);
+  const rz = z - (p.z + p.dz * run);
+  const s = p.dx * rx + p.dz * rz;
+  const n = -p.dz * rx + p.dx * rz;
+  const sa = s / p.along;
+  const nc = n / p.across;
+  const e = p.height * g * g * Math.exp(-0.5 * (sa * sa + nc * nc));
+  if (grad) {
+    // ∇E = E·(−s/σa²·d − n/σc²·d⊥), with d⊥ = (−dz, dx).
+    const a = -s / (p.along * p.along);
+    const c = -n / (p.across * p.across);
+    grad.x = e * (a * p.dx - c * p.dz);
+    grad.z = e * (a * p.dz + c * p.dx);
+  }
+  return e;
+}
+
+const _packetGrad = { x: 0, z: 0 };
 
 export class SeaState {
   /**
@@ -97,8 +198,63 @@ export class SeaState {
     // the whole sea: a hull surfs at some fraction of it, and a rudder is
     // useless once the two are close.
     this.dominant = this.waves[0];
-    this.dominantLength = this.dominant.length;
-    this.dominantSpeed = this.dominant.omega / this.dominant.k;
+    this.dominantLength = this.dominant?.length ?? 0;
+    this.dominantSpeed = this.dominant ? this.dominant.omega / this.dominant.k : 0;
+
+    // The pinch the spectrum has already spent, which is what a packet's own
+    // is measured against (PACKET_PINCH_CEILING).
+    this.pinch = this.waves.reduce((a, w) => a + w.q * w.k * w.amp, 0);
+    this._hMin = this.hMin;
+    this._hMax = this.hMax;
+
+    // The packets, and their table in the shader layout. The arrays are the
+    // uniforms' own values (see waveUniforms), filled in place, so a packet
+    // added to a running sea reaches the shader without anything re-uploaded.
+    this.packets = [];
+    this.packetTable = {
+      a: new Array(MAX_PACKETS * 4).fill(0),
+      b: new Array(MAX_PACKETS * 4).fill(0),
+      c: new Array(MAX_PACKETS * 4).fill(0),
+      phase: new Array(MAX_PACKETS).fill(0),
+    };
+    if (meta.packets) this.setPackets(meta.packets);
+  }
+
+  /**
+   * Put packets on this sea, replacing any it had: at most MAX_PACKETS, each
+   * described as `describePacket` says. An empty list clears them. The bounds
+   * grow to take their peaks. Returns the packets as described.
+   */
+  setPackets(list = []) {
+    if (list.length > MAX_PACKETS) throw new RangeError(`A sea carries at most ${MAX_PACKETS} packets`);
+    this.packets = list.map((p) => describePacket(p, this));
+    const { a, b, c, phase } = this.packetTable;
+    a.fill(0); b.fill(0); c.fill(0); phase.fill(0);
+    this.packets.forEach((p, i) => {
+      a.splice(i * 4, 4, p.dx, p.dz, p.k, p.omega);
+      b.splice(i * 4, 4, p.height, p.q, p.along, p.across);
+      c.splice(i * 4, 4, p.x, p.z, p.born, p.life);
+      phase[i] = p.phase;
+    });
+    const reach = this.packets.reduce((sum, p) => sum + p.height, 0);
+    this.hMin = this._hMin - reach;
+    this.hMax = this._hMax + reach;
+    return this.packets;
+  }
+
+  /**
+   * Where packet `i` is at time t: the centre of its envelope, its height
+   * there now, and whether it is alive. For a game that wants to know how far
+   * off a rogue sea is and when it will arrive.
+   */
+  packetAt(i, t) {
+    const p = this.packets[i];
+    if (!p) return null;
+    const run = p.groupSpeed * (t - p.born);
+    const x = p.x + p.dx * run;
+    const z = p.z + p.dz * run;
+    return { x, z, height: packetEnvelope(p, x, z, t), alive: t > p.born && t < p.born + p.life,
+      groupSpeed: p.groupSpeed, phaseSpeed: p.phaseSpeed, bearingDeg: p.bearingDeg, length: p.length };
   }
 
   /**
@@ -111,12 +267,19 @@ export class SeaState {
     let ux = x;
     let uz = z;
 
-    for (let iter = 0; iter < INVERSION_STEPS; iter++) {
+    // A packet alive at t pinches the crests it rides on harder still, and its
+    // envelope moves with the point; one more step lands it as well as the
+    // plain sea lands.
+    let steps = INVERSION_STEPS;
+    for (const p of this.packets) if (t > p.born && t < p.born + p.life) { steps++; break; }
+
+    for (let iter = 0; iter < steps; iter++) {
       // Residual, and the Jacobian of the forward map, in one sweep.
       let dx = 0;
       let dz = 0;
       let jxx = 1;
       let jxz = 0;
+      let jzx = 0;
       let jzz = 1;
       for (const w of this.waves) {
         const theta = w.k * (w.dx * ux + w.dz * uz) - w.omega * t + w.phase;
@@ -129,15 +292,33 @@ export class SeaState {
         const s = qa * w.k * Math.sin(theta);
         jxx -= s * w.dx * w.dx;
         jxz -= s * w.dx * w.dz;
+        jzx -= s * w.dx * w.dz;
         jzz -= s * w.dz * w.dz;
+      }
+      // A packet's displacement is d·q·E(u)·cosθ, and E moves with u, so its
+      // share of the Jacobian is not symmetric: d ⊗ q·(∇E·cosθ − E·k·sinθ·d).
+      for (const p of this.packets) {
+        const e = packetEnvelope(p, ux, uz, t, _packetGrad);
+        if (e === 0) continue;
+        const theta = p.k * (p.dx * ux + p.dz * uz) - p.omega * t + p.phase;
+        const c = Math.cos(theta);
+        const s = Math.sin(theta);
+        dx += p.dx * p.q * e * c;
+        dz += p.dz * p.q * e * c;
+        const gx = p.q * (_packetGrad.x * c - e * p.k * s * p.dx);
+        const gz = p.q * (_packetGrad.z * c - e * p.k * s * p.dz);
+        jxx += p.dx * gx;
+        jxz += p.dx * gz;
+        jzx += p.dz * gx;
+        jzz += p.dz * gz;
       }
 
       const rx = ux + dx - x;
       const rz = uz + dz - z;
-      const det = jxx * jzz - jxz * jxz;
+      const det = jxx * jzz - jxz * jzx;
       if (Math.abs(det) > MIN_JACOBIAN_DET) {
         ux -= (jzz * rx - jxz * rz) / det;
-        uz -= (jxx * rz - jxz * rx) / det;
+        uz -= (jxx * rz - jzx * rx) / det;
       } else {
         // Degenerate only if the pinch budget has been overspent, which the
         // spectrum will not do. Take the plain step and keep going.
@@ -167,6 +348,15 @@ export class SeaState {
       pz += w.dz * qa * Math.cos(theta);
       py += w.amp * Math.sin(theta);
     }
+    for (const p of this.packets) {
+      const e = packetEnvelope(p, ux, uz, t);
+      if (e === 0) continue;
+      const theta = p.k * (p.dx * ux + p.dz * uz) - p.omega * t + p.phase;
+      const qa = p.q * e;
+      px += p.dx * qa * Math.cos(theta);
+      pz += p.dz * qa * Math.cos(theta);
+      py += e * Math.sin(theta);
+    }
     return out.set(px, py, pz);
   }
 
@@ -190,6 +380,10 @@ export class SeaState {
     for (const w of this.waves) {
       const theta = w.k * (w.dx * x + w.dz * z) - w.omega * t + w.phase;
       h += w.amp * Math.sin(theta);
+    }
+    for (const p of this.packets) {
+      const e = packetEnvelope(p, x, z, t);
+      if (e !== 0) h += e * Math.sin(p.k * (p.dx * x + p.dz * z) - p.omega * t + p.phase);
     }
     return h;
   }
@@ -227,6 +421,10 @@ export class SeaState {
       const theta = w.k * (w.dx * x + w.dz * z) - w.omega * t + w.phase;
       c += w.q * w.k * w.amp * Math.sin(theta);
     }
+    for (const p of this.packets) {
+      const e = packetEnvelope(p, x, z, t);
+      if (e !== 0) c += p.q * p.k * e * Math.sin(p.k * (p.dx * x + p.dz * z) - p.omega * t + p.phase);
+    }
     return c;
   }
 
@@ -249,6 +447,16 @@ export class SeaState {
       const c = Math.cos(theta) * oa;
       vx += w.dx * c;
       vz += w.dz * c;
+      vy += Math.sin(theta) * oa;
+    }
+    for (const p of this.packets) {
+      const e = packetEnvelope(p, u.x, u.z, t);
+      if (e === 0) continue;
+      const theta = p.k * (p.dx * u.x + p.dz * u.z) - p.omega * t + p.phase;
+      const oa = p.omega * e;
+      const c = Math.cos(theta) * oa;
+      vx += p.dx * c;
+      vz += p.dz * c;
       vy += Math.sin(theta) * oa;
     }
     return out.set(vx, vy, vz);
@@ -281,6 +489,15 @@ export function waveUniforms(seaState) {
   return {
     uWaveA: { value: seaState.waves.flatMap((w) => [w.dx, w.dz, w.k, w.omega]) },
     uWaveB: { value: seaState.waves.flatMap((w) => [w.amp, w.q, w.length, w.phase]) },
+    // The packets, three vec4s and a phase each (see SeaState.setPackets). These
+    // are the sea state's own arrays, not copies, so setPackets reaches them.
+    //   uPacketA[i] = (dx, dz, k, omega)
+    //   uPacketB[i] = (height, q, along, across)
+    //   uPacketC[i] = (x, z, born, life)
+    uPacketA: { value: seaState.packetTable.a },
+    uPacketB: { value: seaState.packetTable.b },
+    uPacketC: { value: seaState.packetTable.c },
+    uPacketPhase: { value: seaState.packetTable.phase },
   };
 }
 
@@ -334,6 +551,30 @@ function waveArrayDeclarations(waveCount) {
   // Two vec4s a wave. See waveUniforms.
   uniform vec4 uWaveA[NW];  // dx, dz, k, omega
   uniform vec4 uWaveB[NW];  // amp, q, length, phase
+
+  // The wave packets: rogue seas. See SeaState.setPackets.
+  #define NP ${MAX_PACKETS}
+  uniform vec4 uPacketA[NP];  // dx, dz, k, omega
+  uniform vec4 uPacketB[NP];  // height, q, along, across
+  uniform vec4 uPacketC[NP];  // x, z when born, born, life
+  uniform float uPacketPhase[NP];
+
+  // Packet i's height under its envelope at p and t, nought outside its life.
+  // The CPU packetEnvelope, term for term.
+  float packetEnvelope(int i, vec2 p, float t) {
+    vec4 a = uPacketA[i];
+    vec4 b = uPacketB[i];
+    vec4 c = uPacketC[i];
+    if (c.w <= 0.0 || b.x <= 0.0) return 0.0;
+    float tau = (t - c.z) / c.w;
+    if (tau <= 0.0 || tau >= 1.0) return 0.0;
+    float g = sin(3.14159265358979 * tau);
+    float run = a.w / (2.0 * a.z) * (t - c.z);
+    vec2 r = p - (c.xy + a.xy * run);
+    float sa = dot(r, a.xy) / b.z;
+    float nc = dot(r, vec2(-a.y, a.x)) / b.w;
+    return b.x * g * g * exp(-0.5 * (sa * sa + nc * nc));
+  }
 `;
 }
 
@@ -355,14 +596,14 @@ function waveArrayDeclarations(waveCount) {
  *
  * @param waveCount  must match `seaState.waves.length`.
  */
-function crestLagChunks() {
+function crestLagChunks(omega = 'uWaveA[i].w') {
   const lagDecl = FOAM_LAGS.map((_, i) => `    float crestLag${i} = 0.0;`).join('\n');
 
   // θ(t − τ) = k·d·p − ω(t − τ) + φ = θ(t) + ω·τ. So a lagged crest sum costs
   // one extra sine per wave, not another pass over the table.
   const lagSums = FOAM_LAGS.map(
     ({ lag }, i) =>
-      `      crestLag${i} += qka * sin(theta + uWaveA[i].w * ${glslFloat(lag)});  // ${glslFloat(lag)} s ago`
+      `      crestLag${i} += qka * sin(theta + ${omega} * ${glslFloat(lag)});  // ${glslFloat(lag)} s ago`
   ).join('\n');
 
   // Nested, because GLSL's max takes two arguments however many lags there are.
@@ -373,8 +614,32 @@ function crestLagChunks() {
   return { lagDecl, lagSums, lagFold };
 }
 
+/**
+ * The opening of a packet's term inside a shader loop over NP: the same locals
+ * the wave loop has to hand (d, theta, amp, ka, qka) for packet i at time t.
+ * Its height is the envelope's, attenuated with distance as a wave of its
+ * length would be; a packet that is not alive at this point is skipped.
+ *
+ * Its crest memory and its spill (FOAM_LAGS, SPILL_LEAD) move the phase but
+ * keep the envelope it has now: in five seconds the envelope runs a few tens of
+ * metres of a group several hundred long, and the foam cannot tell.
+ */
+function packetTermOpening(t) {
+  return `
+      float amp = packetEnvelope(i, p, ${t});
+      if (amp <= 0.0) continue;
+      amp *= exp(-camDist / ((6.28318530718 / uPacketA[i].z) * 45.0 + 600.0));
+      if (amp < 0.001) continue;
+
+      vec2 d = uPacketA[i].xy;
+      float theta = uPacketA[i].z * dot(d, p) - uPacketA[i].w * ${t} + uPacketPhase[i];
+      float ka = uPacketA[i].z * amp;
+      float qka = uPacketB[i].y * ka;`;
+}
+
 export function oceanVertexChunk(waveCount = 12) {
   const { lagDecl, lagSums, lagFold } = crestLagChunks();
+  const packetLags = crestLagChunks('uPacketA[i].w').lagSums;
 
   return /* glsl */ `
   ${waveArrayDeclarations(waveCount)}
@@ -413,6 +678,24 @@ ${lagDecl}
 
       crest += qka * s;
 ${lagSums}
+    }
+
+    // The packets, term for term the same, with the envelope's height for amp.
+    for (int i = 0; i < NP; i++) {${packetTermOpening('uTime')}
+      float s = sin(theta);
+      float c = cos(theta);
+      float qa = uPacketB[i].y * amp;
+
+      pos.x += d.x * qa * c;
+      pos.z += d.y * qa * c;
+      pos.y += amp * s;
+
+      normal.x -= d.x * ka * c;
+      normal.z -= d.y * ka * c;
+      normal.y -= qka * s;
+
+      crest += qka * s;
+${packetLags}
     }
 
     normal = normalize(normal);
@@ -465,6 +748,13 @@ export function oceanNormalChunk(waveCount = 12) {
       normal.y -= uWaveB[i].y * ka * sin(theta);
     }
 
+    for (int i = 0; i < NP; i++) {${packetTermOpening('t')}
+
+      normal.x -= d.x * ka * cos(theta);
+      normal.z -= d.y * ka * cos(theta);
+      normal.y -= qka * sin(theta);
+    }
+
     return normalize(normal);
   }
 `;
@@ -489,12 +779,15 @@ export function oceanNormalChunk(waveCount = 12) {
  */
 export function oceanCrestChunk() {
   const { lagDecl, lagSums, lagFold } = crestLagChunks();
+  const packetLags = crestLagChunks('uPacketA[i].w').lagSums;
   // θ(t + τ) = θ(t) − ω·τ: the lead is the lag run the other way.
   const leadDecl = SPILL_LEAD.map((_, i) => `    float lead${i} = 0.0;`).join('\n');
-  const leadSums = SPILL_LEAD.map(
+  const leadSumsFor = (omega) => SPILL_LEAD.map(
     ({ lead }, i) =>
-      `      lead${i} += qka * sin(theta - uWaveA[i].w * ${glslFloat(lead)});  // ${glslFloat(lead)} s ahead`
+      `      lead${i} += qka * sin(theta - ${omega} * ${glslFloat(lead)});  // ${glslFloat(lead)} s ahead`
   ).join('\n');
+  const leadSums = leadSumsFor('uWaveA[i].w');
+  const packetLeads = leadSumsFor('uPacketA[i].w');
   const leadFold = SPILL_LEAD.reduce(
     (acc, { weight }, i) =>
       i === 0 ? `lead0 * ${glslFloat(weight)}` : `max(${acc}, lead${i} * ${glslFloat(weight)})`,
@@ -542,6 +835,20 @@ ${lagDecl}
       crest += qka * s;
 ${leadSums}
 ${lagSums}
+    }
+
+    for (int i = 0; i < NP; i++) {${packetTermOpening('t')}
+      float s = sin(theta);
+      float c = cos(theta);
+      float drawn = 1.0 - smoothstep(0.25, 0.5, px * uPacketA[i].z / 6.28318530718);
+
+      normal.x -= d.x * ka * c * drawn;
+      normal.z -= d.y * ka * c * drawn;
+      normal.y -= qka * s * drawn;
+
+      crest += qka * s;
+${packetLeads}
+${packetLags}
     }
 
     crestOut = ${lagFold};

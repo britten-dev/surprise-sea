@@ -32,10 +32,12 @@ export class WaveField {
    *  mid-game is a change of weather rather than a jump cut. */
   setSeaState(seaState) {
     this.sea = seaState;
-    this.hMin = seaState.hMin;
-    this.hMax = seaState.hMax;
     return this;
   }
+
+  /** The sea's own bounds, read through, so a packet put on it widens them here too. */
+  get hMin() { return this.sea.hMin; }
+  get hMax() { return this.sea.hMax; }
 
   /** A step that is not a finite, positive number of seconds is ignored: one
    *  NaN added to the clock would make every height NaN for good. */

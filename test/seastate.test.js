@@ -13,6 +13,7 @@ import {
   oceanCrestChunk,
   FOAM_LAGS,
   SPILL_LEAD,
+  MAX_PACKETS,
 } from '../src/seastate.js';
 
 const PRESET_NAMES = Object.keys(PRESETS);
@@ -280,8 +281,11 @@ test('crest pinch peaks where the surface is sharpest', () => {
 test('the uniform arrays carry the whole table, in the shader layout', () => {
   const sea = createSeaState({ preset: 'storm', waveCount: 9 });
   const u = waveUniforms(sea);
-  // Two vec4s a wave and nothing else: A = (dx, dz, k, omega), B = (amp, q, length, phase).
-  assert.deepEqual(Object.keys(u), ['uWaveA', 'uWaveB']);
+  // Two vec4s a wave, A = (dx, dz, k, omega), B = (amp, q, length, phase), and
+  // the packet table, empty until a packet is put on the sea.
+  assert.deepEqual(Object.keys(u), ['uWaveA', 'uWaveB', 'uPacketA', 'uPacketB', 'uPacketC', 'uPacketPhase']);
+  for (const key of ['uPacketA', 'uPacketB', 'uPacketC']) assert.deepEqual(u[key].value, new Array(MAX_PACKETS * 4).fill(0), key);
+  assert.deepEqual(u.uPacketPhase.value, new Array(MAX_PACKETS).fill(0));
   for (const key of ['uWaveA', 'uWaveB']) {
     assert.equal(u[key].value.length, 36, key);
     for (const v of u[key].value) assert.ok(Number.isFinite(v), key);

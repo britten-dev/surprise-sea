@@ -107,12 +107,35 @@ Queries (all take explicit `t` seconds):
   (deep-water orbits: u = Σ ω·A·cosθ·d̂ horizontally, w = Σ ω·A·sinθ
   vertically). Hulls and wakes drift with this.
 
+Wave packets — a rogue sea:
+
+- `setPackets(list)` — up to `MAX_PACKETS` (2) packets on this sea, replacing
+  any it had; `[]` clears them. Each is `{ x, z, bearingDeg?, length?, height,
+  pinch?, born, life, along?, across?, phase? }`: a group of two or three
+  great seas under one Gaussian envelope, centred at (x, z) when it is born
+  and running at the group speed cg = ω/2k (half its crests' speed), its
+  height over its life sin²(π·τ). Bearing defaults to the dominant train's,
+  length to 1.15 × the dominant, along to one wavelength, across to two and a
+  half. Its pinch is held under 0.95 with the sea's own, so it never folds.
+  Every query above includes the packets; `heightAt` takes a fourth Newton
+  step while one is alive. `hMin`/`hMax` widen by their heights.
+- `packetAt(i, t)` — `{ x, z, height, alive, groupSpeed, phaseSpeed,
+  bearingDeg, length }`: where the envelope is centred and how big it is.
+- `packets` (as described) and `pinch` (the spectrum's own summed pinch).
+- A sea rebuilt for the weather does not keep them: give the new one the same
+  list (`setPackets`, or `meta.packets` to the constructor). Positions and
+  times are absolute, so it is the same rogue on the new sea.
+
 GPU twin:
 
 - `waveUniforms(seaState)` — two flat uniform arrays, two vec4s a wave:
   uWaveA[i] = (dx, dz, k, ω) and uWaveB[i] = (amp, q, length, phase). The
   wavelets (`render/detail.js`, `detailUniforms`) use the same layout as
-  uDetA/uDetB. Layout only: the numbers are the table's, unchanged.
+  uDetA/uDetB. Layout only: the numbers are the table's, unchanged. The
+  packets come too, as uPacketA[i] = (dx, dz, k, ω), uPacketB[i] = (height, q,
+  along, across), uPacketC[i] = (x, z, born, life) and uPacketPhase[i]: the sea
+  state's own arrays, filled in place by `setPackets`, so a packet put on a
+  running sea reaches the shader with nothing re-uploaded.
 - `oceanVertexChunk(waveCount)` — the GLSL `gerstner(p, camDist, out normal,
   out crest)` function, generated for NW = waveCount, with per-wave distance
   attenuation `exp(-camDist / (L·45 + 600))` so coarse far mesh never aliases.
@@ -127,7 +150,7 @@ const field = new WaveField(seaState, extent /* metres, square */);
 field.advance(dt); field.time;
 field.heightAt(x, z); field.gradientAt(x, z, spread?);
 field.normalAt(x, z, spread?, out?); field.contains(x, z, margin?);
-field.extent; field.half; field.hMin; field.hMax; field.sea;
+field.extent; field.half; field.hMin; field.hMax; field.sea;   // bounds read through from the sea
 field.setSeaState(newSeaState);   // live swap, clock keeps running
 ```
 
