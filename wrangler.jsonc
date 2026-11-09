@@ -1,0 +1,11 @@
+// The Surprise sea demo on Cloudflare: static files only, no server code.
+// Cloudflare builds and deploys main on every push (Workers Builds).
+// Response headers: demo/public/_headers (copied from netlify.toml).
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "surprise-sea",
+  "account_id": "989d38d82b218c948677509b54cf0bb4",
+  "compatibility_date": "2026-11-01",
+  "assets": { "directory": "./dist" },
+  "workers_dev": true
+}
